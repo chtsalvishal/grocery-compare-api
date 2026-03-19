@@ -20,8 +20,10 @@ import json
 import time
 import datetime
 import logging
+import threading
 import requests
 from bs4 import BeautifulSoup
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 from database import ProductRecord
 
@@ -152,29 +154,35 @@ def scrape() -> tuple[list[ProductRecord], Optional[str]]:
 
     now = datetime.datetime.utcnow().isoformat()
     seen: set[int] = set()
+    seen_lock = threading.Lock()
     products: list[ProductRecord] = []
+    products_lock = threading.Lock()
     last_error: Optional[str] = None
+    error_lock = threading.Lock()
 
-    for cat_id, url_path, default_cat in SPECIALS_CATEGORIES:
+    def fetch_and_parse(cat_id: str, url_path: str, default_cat: str) -> None:
+        nonlocal last_error
         slug = url_path.split("/")[-1]
         try:
             data = _fetch_category(cat_id, url_path)
             if data is None:
-                last_error = f"No data for {slug}"
-                time.sleep(1)
-                continue
+                with error_lock:
+                    last_error = f"No data for {slug}"
+                return
 
             total = data.get("TotalRecordCount", 0)
             bundles = data.get("Bundles") or []
             items = [p for b in bundles for p in (b.get("Products") or [])]
             log.info(f"Woolworths {slug}: total={total} items={len(items)}")
 
+            local: list[ProductRecord] = []
             for item in items:
                 stockcode = item.get("Stockcode")
-                if stockcode and stockcode in seen:
-                    continue
-                if stockcode:
-                    seen.add(stockcode)
+                with seen_lock:
+                    if stockcode and stockcode in seen:
+                        continue
+                    if stockcode:
+                        seen.add(stockcode)
 
                 price = item.get("Price")
                 if not price or float(price) <= 0:
@@ -188,7 +196,7 @@ def scrape() -> tuple[list[ProductRecord], Optional[str]]:
                 img = item.get("MediumImageFile") or item.get("LargeImageFile") or ""
                 unit = item.get("PackageSize") or item.get("CupMeasure") or "ea"
 
-                products.append(ProductRecord(
+                local.append(ProductRecord(
                     name=name,
                     category=_categorise(name, default_cat),
                     woolies_price=float(price),
@@ -198,10 +206,21 @@ def scrape() -> tuple[list[ProductRecord], Optional[str]]:
                     last_updated=now,
                 ))
 
+            with products_lock:
+                products.extend(local)
+
         except Exception as e:
-            last_error = f"Error on {slug}: {e}"
+            with error_lock:
+                last_error = f"Error on {slug}: {e}"
             log.warning(f"Woolworths {slug} exception: {e}")
 
-        time.sleep(1)
+    # Fetch all 12 categories concurrently (4 at a time to respect ScrapingBee limits)
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [
+            executor.submit(fetch_and_parse, cat_id, url_path, default_cat)
+            for cat_id, url_path, default_cat in SPECIALS_CATEGORIES
+        ]
+        for future in as_completed(futures):
+            future.result()  # surface any unhandled exceptions
 
     return (products, None) if products else ([], last_error or "No Woolworths products found")

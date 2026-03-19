@@ -15,6 +15,7 @@ import datetime
 import logging
 import os
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import asynccontextmanager
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -39,35 +40,51 @@ _last_sync: SyncResult | None = None
 
 def run_sync() -> SyncResult:
     global _last_sync
-    log.info("Starting sync for all retailers...")
+    log.info("Starting parallel sync for all retailers...")
+
+    scrapers = [
+        ("Woolworths", wools_scraper.scrape),
+        ("Coles",      coles_scraper.scrape),
+        ("Aldi",       aldi_scraper.scrape),
+    ]
+
+    # ── Phase 1: scrape all stores in parallel ──────────────────────────────
+    scrape_results: dict[str, tuple[list, str | None]] = {}
+
+    def _scrape(store: str, fn):
+        log.info(f"Scraping {store}...")
+        try:
+            return store, fn()
+        except Exception as e:
+            log.exception(f"Unhandled error scraping {store}")
+            return store, ([], str(e))
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = {pool.submit(_scrape, s, fn): s for s, fn in scrapers}
+        for future in as_completed(futures):
+            store, result = future.result()
+            scrape_results[store] = result
+
+    # ── Phase 2: write to DB serially (SQLite is single-writer) ─────────────
     statuses: list[SyncStatus] = []
     total = 0
 
-    for store, scrape_fn in [
-        ("Woolworths", wools_scraper.scrape),
-        ("Coles", coles_scraper.scrape),
-        ("Aldi", aldi_scraper.scrape),
-    ]:
-        log.info(f"Scraping {store}...")
-        try:
-            records, error = scrape_fn()
-            if error and not records:
-                log.warning(f"{store} failed: {error}")
-                statuses.append(SyncStatus(store=store, status="error", error=error))
-                continue
+    for store, _ in scrapers:          # preserve insertion order
+        records, error = scrape_results.get(store, ([], "scrape did not complete"))
+        if error and not records:
+            log.warning(f"{store} failed: {error}")
+            statuses.append(SyncStatus(store=store, status="error", error=error))
+            continue
 
-            store_key = store.lower().replace("woolworths", "woolies")
-            clear_store_prices(store_key)
-            upsert_products(records)
+        store_key = store.lower().replace("woolworths", "woolies")
+        clear_store_prices(store_key)
+        upsert_products(records)
 
-            log.info(f"{store}: {len(records)} products synced. Error (partial): {error}")
-            statuses.append(SyncStatus(store=store, status="ok", productsFound=len(records)))
-            total += len(records)
-        except Exception as e:
-            log.exception(f"Unhandled error syncing {store}")
-            statuses.append(SyncStatus(store=store, status="error", error=str(e)))
+        log.info(f"{store}: {len(records)} products saved. Partial error: {error}")
+        statuses.append(SyncStatus(store=store, status="ok", productsFound=len(records)))
+        total += len(records)
 
-    # Cross-store product matching — merge near-identical names from different stores
+    # ── Phase 3: cross-store merge ───────────────────────────────────────────
     try:
         merged = merge_products()
         log.info(f"merge_products: {merged} cross-store merges performed")
