@@ -1,26 +1,30 @@
 """
 Woolworths specials scraper.
 
-Strategy: Use the browse/category API with IsSpecial=True to fetch products
-on special from each major grocery category. Deduplicates by Stockcode.
+Strategy: Use Next.js _next/data endpoints to bypass Akamai WAF, which
+blocks the /apis/ui/browse/category POST from cloud/datacenter IPs with 403.
 
-The old approach searched by keyword and relied on IsOnSpecial=True in results,
-but the search API rarely surfaces specials for generic terms. The browse API
-with IsSpecial=True correctly filters to on-special products and supports
-pagination via TotalRecordCount.
+We first fetch the main specials page to extract the Next.js buildId from
+the __NEXT_DATA__ script tag, then request:
+  GET /_next/data/{buildId}/shop/specials/half-price/{category}.json
+
+These are pre-rendered Next.js data payloads served from the CDN layer and
+are not protected by the same Akamai rules as the browser API endpoints.
 """
 
+import re
 import time
+import json
 import datetime
-import math
-from typing import Optional
-
+import logging
 import requests
-
+from bs4 import BeautifulSoup
+from typing import Optional
 from database import ProductRecord
 
+log = logging.getLogger(__name__)
+
 BASE = "https://www.woolworths.com.au"
-IMG_BASE = "https://cdn0.woolworths.media/content/wowproductimages/large/"
 
 HEADERS = {
     "User-Agent": (
@@ -28,33 +32,26 @@ HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/122.0.0.0 Safari/537.36"
     ),
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-AU,en-US;q=0.9,en;q=0.8",
-    "Origin": BASE,
-    "Referer": f"{BASE}/shop/specials/half-price",
-    "X-Requested-With": "XMLHttpRequest",
-    "Content-Type": "application/json",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-AU,en;q=0.9",
+    "Referer": f"{BASE}/",
 }
 
-# Each tuple: (categoryId, url_path, display_name)
+# URL slug → display category
 SPECIALS_CATEGORIES = [
-    ("1-E5BEE36E", "/shop/specials/half-price/fruit-veg",             "Produce"),
-    ("1_D5A2236",  "/shop/specials/half-price/poultry-meat-seafood",   "Meat"),
-    ("1_6E4F4E4",  "/shop/specials/half-price/dairy-eggs-fridge",      "Dairy"),
-    ("1_DEB537E",  "/shop/specials/half-price/bakery",                 "Bakery"),
-    ("1_717445A",  "/shop/specials/half-price/snacks-confectionery",   "Snacks"),
-    ("1_5AF3A0A",  "/shop/specials/half-price/drinks",                 "Beverages"),
-    ("1_39FD49C",  "/shop/specials/half-price/pantry",                 "Pantry"),
-    ("1_ACA2FC2",  "/shop/specials/half-price/freezer",                "Frozen"),
-    ("1_8D61DD6",  "/shop/specials/half-price/beauty",                 "Personal Care"),
-    ("1_894D0A8",  "/shop/specials/half-price/personal-care",          "Personal Care"),
-    ("1_2432B58",  "/shop/specials/half-price/cleaning-maintenance",   "Household"),
-    ("1_717A94B",  "/shop/specials/half-price/baby",                   "Household"),
+    ("fruit-veg",            "Produce"),
+    ("poultry-meat-seafood", "Meat"),
+    ("dairy-eggs-fridge",    "Dairy"),
+    ("bakery",               "Bakery"),
+    ("snacks-confectionery", "Snacks"),
+    ("drinks",               "Beverages"),
+    ("pantry",               "Pantry"),
+    ("freezer",              "Frozen"),
+    ("beauty",               "Personal Care"),
+    ("personal-care",        "Personal Care"),
+    ("cleaning-maintenance", "Household"),
+    ("baby",                 "Household"),
 ]
-
-PAGE_SIZE = 36
-# Maximum pages to fetch per category (36*10 = 360 products max per cat)
-MAX_PAGES = 10
 
 
 def _categorise(name: str, default_cat: str) -> str:
@@ -82,92 +79,103 @@ def _categorise(name: str, default_cat: str) -> str:
     return default_cat
 
 
-import logging as _log
-
-def _fetch_category_page(
-    session: requests.Session,
-    cat_id: str,
-    url_path: str,
-    page: int,
-) -> tuple[list[dict], int]:
-    """Fetch one page of specials for a category. Returns (items, total_count)."""
-    resp = session.post(
-        f"{BASE}/apis/ui/browse/category",
-        json={
-            "CategoryId": cat_id,
-            "PageNumber": page,
-            "PageSize": PAGE_SIZE,
-            "SortType": "TraderRelevance",
-            "Url": url_path,
-            "FormatObject": {},
-            "IsSpecial": True,
-        },
-        timeout=30,
-    )
-    if not resp.ok:
-        _log.warning(f"Woolworths browse API HTTP {resp.status_code} for {url_path}")
-        return [], 0
-
+def _get_build_id(session: requests.Session) -> Optional[str]:
+    """Extract Next.js buildId from the Woolworths specials page."""
     try:
-        data = resp.json()
-    except Exception:
-        _log.warning(f"Woolworths non-JSON response for {url_path}: {resp.text[:200]}")
-        return [], 0
+        r = session.get(f"{BASE}/shop/specials/half-price", timeout=30)
+        log.info(f"Woolworths specials page: HTTP {r.status_code}")
+        if not r.ok:
+            return None
+        tag = BeautifulSoup(r.text, "lxml").find("script", {"id": "__NEXT_DATA__"})
+        if not tag:
+            log.warning("Woolworths: no __NEXT_DATA__ on specials page")
+            return None
+        build_id = json.loads(tag.string).get("buildId")
+        log.info(f"Woolworths buildId: {build_id}")
+        return build_id
+    except Exception as e:
+        log.warning(f"Woolworths buildId error: {e}")
+        return None
 
-    total = data.get("TotalRecordCount") or 0
-    bundles = data.get("Bundles") or []
-    items = [item for bundle in bundles for item in (bundle.get("Products") or [])]
-    if page == 1:
-        _log.info(f"Woolworths {url_path}: total={total} bundles={len(bundles)} items={len(items)}")
-    return items, total
+
+def _extract_items(page_props: dict, slug: str) -> list[dict]:
+    """Pull the product list out of Next.js pageProps regardless of nesting."""
+    # Log top-level keys on first call to help debug structure changes
+    log.info(f"Woolworths {slug} pageProps keys: {list(page_props.keys())[:20]}")
+
+    # Try known paths
+    candidates = [
+        page_props.get("searchResults", {}).get("products"),
+        page_props.get("products"),
+        page_props.get("Products"),
+    ]
+    for c in candidates:
+        if c:
+            return c
+
+    # Flatten bundle structure (same as browse API)
+    bundles = (
+        page_props.get("searchResults", {}).get("Bundles")
+        or page_props.get("Bundles")
+        or []
+    )
+    if bundles:
+        return [p for b in bundles for p in (b.get("Products") or [])]
+
+    return []
 
 
-def scrape(max_categories: int = len(SPECIALS_CATEGORIES)) -> tuple[list[ProductRecord], Optional[str]]:
+def scrape() -> tuple[list[ProductRecord], Optional[str]]:
     session = requests.Session()
     session.headers.update(HEADERS)
-    # No homepage warmup — on cloud IPs Akamai serves a JS challenge we can't
-    # execute, which poisons the session with invalid bot-detection cookies.
+
+    build_id = _get_build_id(session)
+    if not build_id:
+        return [], "Could not get Woolworths buildId from specials page"
 
     now = datetime.datetime.utcnow().isoformat()
     seen: set[int] = set()
     products: list[ProductRecord] = []
     last_error: Optional[str] = None
 
-    for cat_id, url_path, default_cat in SPECIALS_CATEGORIES[:max_categories]:
+    for slug, default_cat in SPECIALS_CATEGORIES:
         try:
-            # Fetch first page to get total count
-            items, total = _fetch_category_page(session, cat_id, url_path, 1)
-            if not items and total == 0:
+            url = f"{BASE}/_next/data/{build_id}/shop/specials/half-price/{slug}.json"
+            r = session.get(url, timeout=30)
+            if not r.ok:
+                log.warning(f"Woolworths _next {slug}: HTTP {r.status_code}")
+                last_error = f"HTTP {r.status_code} for {slug}"
                 time.sleep(0.5)
                 continue
 
-            all_items = list(items)
+            try:
+                data = r.json()
+            except Exception:
+                log.warning(f"Woolworths _next {slug}: non-JSON response {r.text[:200]}")
+                last_error = f"Non-JSON response for {slug}"
+                time.sleep(0.5)
+                continue
 
-            # Fetch remaining pages
-            total_pages = min(math.ceil(total / PAGE_SIZE), MAX_PAGES)
-            for page in range(2, total_pages + 1):
-                time.sleep(0.4)
-                page_items, _ = _fetch_category_page(session, cat_id, url_path, page)
-                if not page_items:
-                    break
-                all_items.extend(page_items)
+            page_props = data.get("pageProps", {})
+            items = _extract_items(page_props, slug)
+            log.info(f"Woolworths {slug}: {len(items)} products")
 
-            # API already filters with IsSpecial=True — accept all returned items
-            for item in all_items:
-                stockcode = item.get("Stockcode")
+            for item in items:
+                stockcode = item.get("Stockcode") or item.get("stockcode")
                 if stockcode and stockcode in seen:
                     continue
                 if stockcode:
                     seen.add(stockcode)
 
-                price = item.get("Price")
+                price = item.get("Price") or item.get("price")
                 if not price or float(price) <= 0:
                     continue
-                name = (item.get("Name") or "").strip()
+
+                name = (item.get("Name") or item.get("name") or "").strip()
                 if not name:
                     continue
 
-                was = item.get("WasPrice")
+                was = item.get("WasPrice") or item.get("wasPrice")
                 img = item.get("MediumImageFile") or item.get("LargeImageFile") or ""
                 unit = item.get("PackageSize") or item.get("CupMeasure") or "ea"
 
@@ -182,7 +190,8 @@ def scrape(max_categories: int = len(SPECIALS_CATEGORIES)) -> tuple[list[Product
                 ))
 
         except Exception as e:
-            last_error = f"Error on category '{url_path}': {e}"
+            last_error = f"Error on {slug}: {e}"
+            log.warning(f"Woolworths {slug} exception: {e}")
 
         time.sleep(0.5)
 
