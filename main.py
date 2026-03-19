@@ -14,6 +14,7 @@ Endpoints:
 import datetime
 import logging
 import os
+import threading
 from contextlib import asynccontextmanager
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -92,9 +93,9 @@ scheduler = BackgroundScheduler()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Run an initial sync on startup so the DB has data immediately
-    log.info("Running initial sync on startup...")
-    run_sync()
+    # Run initial sync in background so port binds immediately
+    log.info("Scheduling initial sync in background thread...")
+    threading.Thread(target=run_sync, daemon=True).start()
 
     # Schedule daily sync at 06:00 UTC (4 PM AEST, after supermarkets post new catalogues)
     scheduler.add_job(run_sync, "cron", hour=6, minute=0, id="daily_sync")
