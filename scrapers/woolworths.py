@@ -104,11 +104,13 @@ def _build_scenario(cat_id: str, url_path: str) -> str:
         "});"
     )
 
-    return json.dumps([
-        {"wait": 5000},
-        {"evaluate": js},
-        {"wait": 8000},
-    ])
+    return json.dumps({
+        "instructions": [
+            {"wait": 5000},
+            {"evaluate": js},
+            {"wait": 8000},
+        ]
+    })
 
 
 def _fetch_category(cat_id: str, url_path: str) -> Optional[dict]:
