@@ -1,17 +1,23 @@
 """
 Woolworths specials scraper.
 
-Strategy: ScrapingBee with render_js=true opens a real Chrome browser that
-solves Akamai's JavaScript challenge, waits for the Angular SPA to call the
-browse API and render product tiles, then returns the fully rendered HTML.
-We parse that HTML with BeautifulSoup.
+Strategy: ScrapingBee js_scenario
+  1. Open the specials page in a real Chrome browser (solves Akamai JS challenge,
+     sets _abck / bm_* session cookies).
+  2. After 5 s (Akamai + Angular bootstrap), execute a fetch() call to the
+     browse API from INSIDE the browser — cookies are included automatically.
+  3. Store the raw JSON response in a <script id="wdata"> tag in the DOM.
+  4. Wait 8 s for the fetch to complete.
+  5. ScrapingBee returns the final HTML; we extract and parse the JSON.
 
-Credit cost: 5 credits/request × 12 categories = 60 credits/sync.
-ScrapingBee free tier = 1,000 credits/month ≈ 16 syncs/month (every 2 days).
+Cost: 5 ScrapingBee credits/request × 12 categories = 60 credits/sync.
+Free tier = 1,000 credits/month ≈ 16 syncs/month.
 """
 
 import os
 import re
+import json
+import base64
 import time
 import datetime
 import logging
@@ -26,22 +32,20 @@ BASE = "https://www.woolworths.com.au"
 SCRAPINGBEE_KEY = os.environ.get("SCRAPINGBEE_API_KEY", "")
 SCRAPINGBEE_URL = "https://app.scrapingbee.com/api/v1/"
 
-# Seconds to wait after page load for Angular + browse API to finish rendering.
-RENDER_WAIT_MS = 8000
-
+# (category_id, url_path, display_category)
 SPECIALS_CATEGORIES = [
-    ("fruit-veg",            "Produce"),
-    ("poultry-meat-seafood", "Meat"),
-    ("dairy-eggs-fridge",    "Dairy"),
-    ("bakery",               "Bakery"),
-    ("snacks-confectionery", "Snacks"),
-    ("drinks",               "Beverages"),
-    ("pantry",               "Pantry"),
-    ("freezer",              "Frozen"),
-    ("beauty",               "Personal Care"),
-    ("personal-care",        "Personal Care"),
-    ("cleaning-maintenance", "Household"),
-    ("baby",                 "Household"),
+    ("1-E5BEE36E", "/shop/specials/half-price/fruit-veg",            "Produce"),
+    ("1_D5A2236",  "/shop/specials/half-price/poultry-meat-seafood",  "Meat"),
+    ("1_6E4F4E4",  "/shop/specials/half-price/dairy-eggs-fridge",     "Dairy"),
+    ("1_DEB537E",  "/shop/specials/half-price/bakery",                "Bakery"),
+    ("1_717445A",  "/shop/specials/half-price/snacks-confectionery",  "Snacks"),
+    ("1_5AF3A0A",  "/shop/specials/half-price/drinks",                "Beverages"),
+    ("1_39FD49C",  "/shop/specials/half-price/pantry",                "Pantry"),
+    ("1_ACA2FC2",  "/shop/specials/half-price/freezer",               "Frozen"),
+    ("1_8D61DD6",  "/shop/specials/half-price/beauty",                "Personal Care"),
+    ("1_894D0A8",  "/shop/specials/half-price/personal-care",         "Personal Care"),
+    ("1_2432B58",  "/shop/specials/half-price/cleaning-maintenance",  "Household"),
+    ("1_717A94B",  "/shop/specials/half-price/baby",                  "Household"),
 ]
 
 
@@ -70,127 +74,75 @@ def _categorise(name: str, default_cat: str) -> str:
     return default_cat
 
 
-def _fetch_rendered(url: str) -> requests.Response:
-    """Fetch a URL through ScrapingBee with full JavaScript rendering."""
-    return requests.get(
+def _build_scenario(cat_id: str, url_path: str) -> str:
+    """
+    Build a base64-encoded ScrapingBee js_scenario that:
+      - Waits 5 s for Akamai challenge + Angular bootstrap
+      - Calls the browse API via fetch() from the authenticated browser context
+      - Stores the JSON response in <script id="wdata" type="application/json">
+      - Waits 8 s for the fetch to resolve
+    """
+    # Build the JS fetch body as an object literal (no nested quoting issues)
+    js = (
+        "var d={"
+        f"CategoryId:'{cat_id}',"
+        "PageNumber:1,PageSize:36,SortType:'TraderRelevance',"
+        f"Url:'{url_path}',"
+        "FormatObject:{},IsSpecial:true"
+        "};"
+        "fetch('/apis/ui/browse/category',{"
+        "method:'POST',"
+        "headers:{'Content-Type':'application/json'},"
+        "body:JSON.stringify(d)"
+        "}).then(function(r){return r.text();})"
+        ".then(function(t){"
+        "var s=document.createElement('script');"
+        "s.type='application/json';"
+        "s.id='wdata';"
+        "s.textContent=t;"
+        "document.body.appendChild(s);"
+        "});"
+    )
+
+    scenario = json.dumps([
+        {"wait": 5000},
+        {"evaluate": js},
+        {"wait": 8000},
+    ])
+    return base64.b64encode(scenario.encode()).decode()
+
+
+def _fetch_category(cat_id: str, url_path: str) -> Optional[dict]:
+    slug = url_path.split("/")[-1]
+    page_url = f"{BASE}{url_path}"
+
+    r = requests.get(
         SCRAPINGBEE_URL,
         params={
             "api_key": SCRAPINGBEE_KEY,
-            "url": url,
+            "url": page_url,
             "render_js": "true",
-            "wait": str(RENDER_WAIT_MS),
-            "block_resources": "false",
+            "js_scenario": _build_scenario(cat_id, url_path),
         },
-        timeout=90,
+        timeout=120,
     )
+    log.info(f"Woolworths {slug}: HTTP {r.status_code} len={len(r.text)}")
 
+    if not r.ok:
+        log.warning(f"Woolworths {slug}: ScrapingBee error {r.status_code}: {r.text[:200]}")
+        return None
 
-def _parse_tiles(html: str, slug: str, default_cat: str, now: str, seen: set) -> list[ProductRecord]:
-    soup = BeautifulSoup(html, "lxml")
-    products: list[ProductRecord] = []
+    soup = BeautifulSoup(r.text, "lxml")
+    tag = soup.find("script", {"id": "wdata", "type": "application/json"})
+    if not tag or not tag.string:
+        log.warning(f"Woolworths {slug}: wdata script tag not found — fetch may not have completed")
+        return None
 
-    # --- Selector strategy: try most-specific first, fall back progressively ---
-
-    # 1. Woolworths Angular renders product tiles as <wc-product-tile> or <shared-product-tile>
-    tiles = soup.select("wc-product-tile, shared-product-tile")
-
-    # 2. Angular component rendered as divs with product-tile in class
-    if not tiles:
-        tiles = soup.select("div[class*='product-tile'], article[class*='product-tile']")
-
-    # 3. Any element carrying a stockcode/productid data attribute
-    if not tiles:
-        tiles = soup.select("[data-stockcode], [data-productid], [data-product-id]")
-
-    if not tiles:
-        # Log rendered HTML so we can identify the correct selector in one fix
-        log.warning(f"Woolworths {slug}: no product tiles found (len={len(html)})")
-        log.warning(f"Woolworths {slug} rendered snippet: {html[5000:8000]}")
-        return []
-
-    log.info(f"Woolworths {slug}: {len(tiles)} tiles found")
-
-    for tile in tiles:
-        # --- Product name ---
-        # Try heading tags first, then any element with 'name' or 'title' in class
-        name_el = (
-            tile.select_one("h2, h3, h4")
-            or tile.select_one("[class*='title'], [class*='name'], [class*='description']")
-        )
-        name = name_el.get_text(strip=True) if name_el else ""
-
-        # Fall back to data attributes
-        if not name:
-            name = (
-                tile.get("data-name")
-                or tile.get("data-product-name")
-                or tile.get("title")
-                or ""
-            ).strip()
-
-        if not name or len(name) < 3:
-            continue
-
-        # --- Price ---
-        # Woolworths renders current price in a "price" element
-        price_el = (
-            tile.select_one("[class*='price--now'], [class*='price-now']")
-            or tile.select_one("[class*='primary'] [class*='price']")
-            or tile.select_one("[class*='price']")
-        )
-        price_text = price_el.get_text(strip=True) if price_el else ""
-        price = _extract_price(price_text)
-        if price is None or price <= 0:
-            continue
-
-        # --- Was-price ---
-        was_el = (
-            tile.select_one("[class*='price--was'], [class*='was-price'], [class*='price-was']")
-            or tile.select_one("[class*='was']")
-        )
-        was_text = was_el.get_text(strip=True) if was_el else ""
-        was_price = _extract_price(was_text)
-
-        # --- Deduplicate ---
-        stockcode = tile.get("data-stockcode") or tile.get("data-productid") or name
-        if stockcode in seen:
-            continue
-        seen.add(stockcode)
-
-        # --- Image ---
-        img_el = tile.find("img")
-        img_url = None
-        if img_el:
-            src = img_el.get("src") or img_el.get("data-src") or ""
-            if src.startswith("http"):
-                img_url = src
-
-        # --- Unit ---
-        unit_el = tile.select_one("[class*='cup'], [class*='unit'], [class*='measure']")
-        unit = unit_el.get_text(strip=True) if unit_el else "ea"
-        unit = re.sub(r"\s+", " ", unit).strip() or "ea"
-
-        products.append(ProductRecord(
-            name=name,
-            category=_categorise(name, default_cat),
-            woolies_price=price,
-            woolies_was_price=was_price,
-            unit=unit,
-            image_url=img_url,
-            last_updated=now,
-        ))
-
-    return products
-
-
-def _extract_price(text: str) -> Optional[float]:
-    m = re.search(r"\$?\s*(\d+\.\d{2})", text.replace(",", ""))
-    if m:
-        return float(m.group(1))
-    m = re.search(r"\$\s*(\d+)\b", text)
-    if m:
-        return float(m.group(1))
-    return None
+    try:
+        return json.loads(tag.string)
+    except Exception as e:
+        log.warning(f"Woolworths {slug}: JSON parse error: {e} — snippet: {(tag.string or '')[:200]}")
+        return None
 
 
 def scrape() -> tuple[list[ProductRecord], Optional[str]]:
@@ -198,26 +150,52 @@ def scrape() -> tuple[list[ProductRecord], Optional[str]]:
         return [], "SCRAPINGBEE_API_KEY not set"
 
     now = datetime.datetime.utcnow().isoformat()
-    seen: set[str] = set()
+    seen: set[int] = set()
     products: list[ProductRecord] = []
     last_error: Optional[str] = None
 
-    for slug, default_cat in SPECIALS_CATEGORIES:
-        url = f"{BASE}/shop/specials/half-price/{slug}"
+    for cat_id, url_path, default_cat in SPECIALS_CATEGORIES:
+        slug = url_path.split("/")[-1]
         try:
-            r = _fetch_rendered(url)
-            log.info(f"Woolworths {slug}: ScrapingBee HTTP {r.status_code} len={len(r.text)}")
-
-            if not r.ok:
-                last_error = f"ScrapingBee HTTP {r.status_code} for {slug}"
+            data = _fetch_category(cat_id, url_path)
+            if data is None:
+                last_error = f"No data for {slug}"
                 time.sleep(1)
                 continue
 
-            page_products = _parse_tiles(r.text, slug, default_cat, now, seen)
-            products.extend(page_products)
+            total = data.get("TotalRecordCount", 0)
+            bundles = data.get("Bundles") or []
+            items = [p for b in bundles for p in (b.get("Products") or [])]
+            log.info(f"Woolworths {slug}: total={total} items={len(items)}")
 
-            if not page_products:
-                last_error = f"No tiles parsed for {slug}"
+            for item in items:
+                stockcode = item.get("Stockcode")
+                if stockcode and stockcode in seen:
+                    continue
+                if stockcode:
+                    seen.add(stockcode)
+
+                price = item.get("Price")
+                if not price or float(price) <= 0:
+                    continue
+
+                name = (item.get("Name") or "").strip()
+                if not name:
+                    continue
+
+                was = item.get("WasPrice")
+                img = item.get("MediumImageFile") or item.get("LargeImageFile") or ""
+                unit = item.get("PackageSize") or item.get("CupMeasure") or "ea"
+
+                products.append(ProductRecord(
+                    name=name,
+                    category=_categorise(name, default_cat),
+                    woolies_price=float(price),
+                    woolies_was_price=float(was) if was else None,
+                    unit=unit,
+                    image_url=img if img.startswith("http") else None,
+                    last_updated=now,
+                ))
 
         except Exception as e:
             last_error = f"Error on {slug}: {e}"
