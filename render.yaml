@@ -7,9 +7,3 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: "3.11.0"
-      - key: DB_PATH
-        value: /data/specials.db
-    disk:
-      name: specials-db
-      mountPath: /data
-      sizeGB: 1

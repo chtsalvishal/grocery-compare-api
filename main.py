@@ -20,7 +20,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-from database import get_all_products, upsert_products, clear_store_prices
+from database import get_all_products, upsert_products, clear_store_prices, merge_products
 from models import SpecialProduct, SyncResult, SyncStatus
 import scrapers.woolworths as wools_scraper
 import scrapers.coles as coles_scraper
@@ -65,6 +65,13 @@ def run_sync() -> SyncResult:
         except Exception as e:
             log.exception(f"Unhandled error syncing {store}")
             statuses.append(SyncStatus(store=store, status="error", error=str(e)))
+
+    # Cross-store product matching — merge near-identical names from different stores
+    try:
+        merged = merge_products()
+        log.info(f"merge_products: {merged} cross-store merges performed")
+    except Exception as e:
+        log.warning(f"merge_products failed (non-fatal): {e}")
 
     result = SyncResult(
         total=total,
@@ -133,11 +140,24 @@ def get_specials(
     category: str | None = Query(default=None, description="Filter by category name"),
     store: str | None = Query(default=None, description="Filter: coles | woolies | aldi"),
     q: str | None = Query(default=None, description="Search product name"),
+    sort: str | None = Query(
+        default="multi_store",
+        description=(
+            "Sort order: multi_store (default) | price_asc | price_desc | savings | az"
+        ),
+    ),
 ):
     """
     Return all current specials from the DB.
     Optionally filter by category, store, or name query.
     Only returns products that have at least one active price.
+
+    Sort options:
+      - multi_store  Products available at 2+ stores first, then alphabetically (default)
+      - price_asc    Cheapest first (lowest active price)
+      - price_desc   Most expensive first (highest active price)
+      - savings      Biggest price savings (was_price - now_price) first
+      - az           Alphabetical A→Z
     """
     records = get_all_products()
 
@@ -181,11 +201,43 @@ def get_specials(
             )
         )
 
-    # Sort: products available at multiple stores first, then alphabetically
-    results.sort(key=lambda p: (
-        -sum(1 for x in [p.colesPrice, p.wooliesPrice, p.aldiPrice] if x),
-        p.name.lower()
-    ))
+    # Helper: lowest active price for a product
+    def _min_price(p: SpecialProduct) -> float:
+        prices = [x for x in [p.colesPrice, p.wooliesPrice, p.aldiPrice] if x]
+        return min(prices) if prices else 0.0
+
+    def _max_price(p: SpecialProduct) -> float:
+        prices = [x for x in [p.colesPrice, p.wooliesPrice, p.aldiPrice] if x]
+        return max(prices) if prices else 0.0
+
+    def _max_saving(p: SpecialProduct) -> float:
+        saving = 0.0
+        pairs = [
+            (p.colesPrice, p.colesWasPrice),
+            (p.wooliesPrice, p.wooliesWasPrice),
+            (p.aldiPrice, p.aldiWasPrice),
+        ]
+        for now, was in pairs:
+            if now and was and was > now:
+                saving = max(saving, was - now)
+        return saving
+
+    def _store_count(p: SpecialProduct) -> int:
+        return sum(1 for x in [p.colesPrice, p.wooliesPrice, p.aldiPrice] if x)
+
+    sort_key = (sort or "multi_store").lower()
+
+    if sort_key == "price_asc":
+        results.sort(key=lambda p: (_min_price(p), p.name.lower()))
+    elif sort_key == "price_desc":
+        results.sort(key=lambda p: (-_max_price(p), p.name.lower()))
+    elif sort_key == "savings":
+        results.sort(key=lambda p: (-_max_saving(p), p.name.lower()))
+    elif sort_key == "az":
+        results.sort(key=lambda p: p.name.lower())
+    else:
+        # Default: multi_store — products at more stores first, then alphabetically
+        results.sort(key=lambda p: (-_store_count(p), p.name.lower()))
 
     return results
 

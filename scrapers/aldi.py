@@ -2,7 +2,7 @@
 Aldi specials scraper.
 
 Strategy:
-  Aldi Australia's grocery page is server-rendered HTML with minimal bot protection.
+  Aldi Australia's grocery pages are server-rendered HTML with minimal bot protection.
   Each product tile has class "product-tile" and contains:
     - .product-tile__brandname p  → brand (e.g. "HARIBO")
     - .product-tile__name p       → product name (e.g. "Mega Roulette 45g")
@@ -10,13 +10,16 @@ Strategy:
     - .product-tile__unit-of-measurement p → unit (e.g. "45 g")
     - img[src]                    → product image
 
-  We combine brand + name for the full product name.
+  Aldi serves its grocery section as a SPA; the old /en/groceries/* category URLs
+  all redirect to the main page. The correct URLs use the pattern
+  /products/{category}/k/{id}. We scrape each top-level grocery category to get
+  ~30 unique products per category, totalling ~400 products.
 """
 
 import re
 import time
 import requests
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup
 from typing import Optional
 from database import ProductRecord
 import datetime
@@ -34,10 +37,24 @@ HEADERS = {
     "Referer": f"{BASE}/",
 }
 
-SPECIALS_URLS = [
-    f"{BASE}/en/groceries/",
-    f"{BASE}/specials/",
-    f"{BASE}/en/specials/",
+# Top-level grocery category pages — each returns ~30 distinct product tiles.
+# Paths confirmed from live site navigation as of 2026-03.
+CATEGORY_PAGES = [
+    ("/products/fruits-vegetables/k/950000000",           "Produce"),
+    ("/products/meat-seafood/k/940000000",                "Meat"),
+    ("/products/deli-chilled-meats/k/930000000",          "Meat"),
+    ("/products/dairy-eggs-fridge/k/960000000",           "Dairy"),
+    ("/products/bakery/k/920000000",                      "Bakery"),
+    ("/products/pantry/k/970000000",                      "Pantry"),
+    ("/products/freezer/k/980000000",                     "Frozen"),
+    ("/products/drinks/k/1000000000",                     "Beverages"),
+    ("/products/snacks-confectionery/k/1588161408332087", "Snacks"),
+    ("/products/health-beauty/k/1040000000",              "Personal Care"),
+    ("/products/cleaning-household/k/1050000000",         "Household"),
+    ("/products/baby/k/1030000000",                       "Household"),
+    ("/products/pets/k/1020000000",                       "Weekly Specials"),
+    ("/products/lower-prices/k/1588161425841179",         "Weekly Specials"),
+    ("/products/super-savers/k/1588161426952145",         "Weekly Specials"),
 ]
 
 
@@ -51,35 +68,34 @@ def _extract_price(text: str) -> Optional[float]:
     return None
 
 
-def _categorise(name: str) -> str:
+def _categorise(name: str, default_cat: str) -> str:
     n = name.lower()
     if any(w in n for w in ["milk", "cheese", "yogurt", "butter", "cream", "egg"]):
         return "Dairy"
-    if any(w in n for w in ["chicken", "beef", "pork", "lamb", "mince", "steak", "sausage", "bacon"]):
+    if any(w in n for w in ["chicken", "beef", "pork", "lamb", "mince", "steak", "sausage", "bacon", "prawn", "fish", "salmon"]):
         return "Meat"
-    if any(w in n for w in ["apple", "banana", "tomato", "onion", "potato", "carrot", "lettuce", "salad"]):
+    if any(w in n for w in ["apple", "banana", "tomato", "onion", "potato", "carrot", "lettuce", "salad", "broccoli"]):
         return "Produce"
-    if any(w in n for w in ["bread", "roll", "cake", "cookie", "pastry", "donut"]):
+    if any(w in n for w in ["bread", "roll", "cake", "cookie", "pastry", "donut", "muffin"]):
         return "Bakery"
-    if any(w in n for w in ["pasta", "rice", "flour", "sugar", "oil", "sauce", "cereal", "canned"]):
+    if any(w in n for w in ["pasta", "rice", "flour", "sugar", "oil", "sauce", "cereal", "canned", "tinned", "soup", "noodle"]):
         return "Pantry"
     if any(w in n for w in ["frozen", "ice cream", "pizza"]):
         return "Frozen"
-    if any(w in n for w in ["water", "juice", "drink", "soda", "coffee", "tea"]):
+    if any(w in n for w in ["water", "juice", "drink", "soda", "coffee", "tea", "cordial", "energy"]):
         return "Beverages"
-    if any(w in n for w in ["chip", "chocolate", "biscuit", "snack", "lolly"]):
+    if any(w in n for w in ["chip", "chocolate", "biscuit", "snack", "lolly", "candy", "popcorn", "cracker"]):
         return "Snacks"
-    if any(w in n for w in ["shampoo", "toothpaste", "deodorant", "soap", "body wash"]):
+    if any(w in n for w in ["shampoo", "toothpaste", "deodorant", "soap", "body wash", "moisturiser", "sunscreen"]):
         return "Personal Care"
-    if any(w in n for w in ["cleaning", "detergent", "paper", "tissue", "bin", "nappy"]):
+    if any(w in n for w in ["cleaning", "detergent", "paper", "tissue", "bin", "nappy", "dishwash", "bleach"]):
         return "Household"
-    return "Weekly Specials"
+    return default_cat
 
 
-def _parse_tiles(html: str, now: str) -> list[ProductRecord]:
+def _parse_tiles(html: str, now: str, default_cat: str, seen: set[str]) -> list[ProductRecord]:
     soup = BeautifulSoup(html, "lxml")
     products: list[ProductRecord] = []
-    seen: set[str] = set()
 
     tiles = soup.select(".product-tile")
     if not tiles:
@@ -92,7 +108,6 @@ def _parse_tiles(html: str, now: str) -> list[ProductRecord]:
         brand = brand_el.get_text(strip=True) if brand_el else ""
         prod_name = name_el.get_text(strip=True) if name_el else ""
 
-        # Fall back to the tile's title attribute
         if not prod_name:
             prod_name = tile.get("title", "").strip()
 
@@ -103,7 +118,7 @@ def _parse_tiles(html: str, now: str) -> list[ProductRecord]:
             continue
         seen.add(full_name)
 
-        # Price — use .base-price__regular, not comparison price
+        # Price
         price_el = tile.select_one(".base-price__regular span")
         if not price_el:
             continue
@@ -126,7 +141,7 @@ def _parse_tiles(html: str, now: str) -> list[ProductRecord]:
 
         products.append(ProductRecord(
             name=full_name,
-            category=_categorise(full_name),
+            category=_categorise(full_name, default_cat),
             aldi_price=price,
             unit=unit,
             image_url=img_url,
@@ -141,8 +156,11 @@ def scrape() -> tuple[list[ProductRecord], Optional[str]]:
     session.headers.update(HEADERS)
     now = datetime.datetime.utcnow().isoformat()
     last_error = None
+    all_products: list[ProductRecord] = []
+    seen: set[str] = set()
 
-    for url in SPECIALS_URLS:
+    for path, default_cat in CATEGORY_PAGES:
+        url = f"{BASE}{path}"
         try:
             resp = session.get(url, timeout=30)
             if not resp.ok:
@@ -150,14 +168,18 @@ def scrape() -> tuple[list[ProductRecord], Optional[str]]:
                 time.sleep(1)
                 continue
 
-            products = _parse_tiles(resp.text, now)
-            if products:
-                return products, None
+            page_products = _parse_tiles(resp.text, now, default_cat, seen)
+            all_products.extend(page_products)
 
-            last_error = f"No product tiles found at {url}"
+            if not page_products:
+                last_error = f"No product tiles found at {url}"
+
         except Exception as e:
             last_error = f"Request error at {url}: {e}"
 
-        time.sleep(1)
+        time.sleep(0.8)
+
+    if all_products:
+        return all_products, None
 
     return [], last_error or "No Aldi products found"
