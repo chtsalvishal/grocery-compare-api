@@ -1,21 +1,18 @@
 """
 Woolworths specials scraper.
 
-Strategy: Use Next.js _next/data endpoints to bypass Akamai WAF, which
-blocks the /apis/ui/browse/category POST from cloud/datacenter IPs with 403.
+Strategy: ScrapingBee with render_js=true opens a real Chrome browser that
+solves Akamai's JavaScript challenge, waits for the Angular SPA to call the
+browse API and render product tiles, then returns the fully rendered HTML.
+We parse that HTML with BeautifulSoup.
 
-We first fetch the main specials page to extract the Next.js buildId from
-the __NEXT_DATA__ script tag, then request:
-  GET /_next/data/{buildId}/shop/specials/half-price/{category}.json
-
-These are pre-rendered Next.js data payloads served from the CDN layer and
-are not protected by the same Akamai rules as the browser API endpoints.
+Credit cost: 5 credits/request × 12 categories = 60 credits/sync.
+ScrapingBee free tier = 1,000 credits/month ≈ 16 syncs/month (every 2 days).
 """
 
-import re
 import os
+import re
 import time
-import json
 import datetime
 import logging
 import requests
@@ -29,18 +26,9 @@ BASE = "https://www.woolworths.com.au"
 SCRAPINGBEE_KEY = os.environ.get("SCRAPINGBEE_API_KEY", "")
 SCRAPINGBEE_URL = "https://app.scrapingbee.com/api/v1/"
 
+# Seconds to wait after page load for Angular + browse API to finish rendering.
+RENDER_WAIT_MS = 8000
 
-def _get(url: str, timeout: int = 30) -> requests.Response:
-    """Fetch a URL, routing through ScrapingBee if an API key is configured."""
-    if SCRAPINGBEE_KEY:
-        return requests.get(
-            SCRAPINGBEE_URL,
-            params={"api_key": SCRAPINGBEE_KEY, "url": url, "render_js": "false"},
-            timeout=timeout,
-        )
-    return requests.get(url, timeout=timeout)
-
-# URL slug → display category
 SPECIALS_CATEGORIES = [
     ("fruit-veg",            "Produce"),
     ("poultry-meat-seafood", "Meat"),
@@ -82,135 +70,159 @@ def _categorise(name: str, default_cat: str) -> str:
     return default_cat
 
 
-def _get_build_id() -> Optional[str]:
-    """Extract Next.js buildId from the Woolworths specials page."""
-    try:
-        r = _get(f"{BASE}/shop/specials/half-price")
-        log.info(f"Woolworths specials page: HTTP {r.status_code} len={len(r.text)}")
-        if not r.ok:
-            return None
-
-        html = r.text
-
-        # Method 1: __NEXT_DATA__ script tag (standard Next.js SSR)
-        tag = BeautifulSoup(html, "lxml").find("script", {"id": "__NEXT_DATA__"})
-        if tag:
-            build_id = json.loads(tag.string).get("buildId")
-            log.info(f"Woolworths buildId (NEXT_DATA): {build_id}")
-            return build_id
-
-        # Method 2: buildId embedded in inline script as JSON string
-        m = re.search(r'"buildId"\s*:\s*"([^"]+)"', html)
-        if m:
-            log.info(f"Woolworths buildId (inline script): {m.group(1)}")
-            return m.group(1)
-
-        # Method 3: infer from /_next/static/{buildId}/ path references
-        m = re.search(r'/_next/static/([^/"]+)/', html)
-        if m:
-            log.info(f"Woolworths buildId (static path): {m.group(1)}")
-            return m.group(1)
-
-        # Log a snippet to diagnose what the page looks like
-        log.warning(f"Woolworths: no buildId found. Page snippet: {html[:500]}")
-        return None
-    except Exception as e:
-        log.warning(f"Woolworths buildId error: {e}")
-        return None
-
-
-def _extract_items(page_props: dict, slug: str) -> list[dict]:
-    """Pull the product list out of Next.js pageProps regardless of nesting."""
-    # Log top-level keys on first call to help debug structure changes
-    log.info(f"Woolworths {slug} pageProps keys: {list(page_props.keys())[:20]}")
-
-    # Try known paths
-    candidates = [
-        page_props.get("searchResults", {}).get("products"),
-        page_props.get("products"),
-        page_props.get("Products"),
-    ]
-    for c in candidates:
-        if c:
-            return c
-
-    # Flatten bundle structure (same as browse API)
-    bundles = (
-        page_props.get("searchResults", {}).get("Bundles")
-        or page_props.get("Bundles")
-        or []
+def _fetch_rendered(url: str) -> requests.Response:
+    """Fetch a URL through ScrapingBee with full JavaScript rendering."""
+    return requests.get(
+        SCRAPINGBEE_URL,
+        params={
+            "api_key": SCRAPINGBEE_KEY,
+            "url": url,
+            "render_js": "true",
+            "wait": str(RENDER_WAIT_MS),
+            "block_resources": "false",
+        },
+        timeout=90,
     )
-    if bundles:
-        return [p for b in bundles for p in (b.get("Products") or [])]
 
-    return []
+
+def _parse_tiles(html: str, slug: str, default_cat: str, now: str, seen: set) -> list[ProductRecord]:
+    soup = BeautifulSoup(html, "lxml")
+    products: list[ProductRecord] = []
+
+    # --- Selector strategy: try most-specific first, fall back progressively ---
+
+    # 1. Woolworths Angular renders product tiles as <wc-product-tile> or <shared-product-tile>
+    tiles = soup.select("wc-product-tile, shared-product-tile")
+
+    # 2. Angular component rendered as divs with product-tile in class
+    if not tiles:
+        tiles = soup.select("div[class*='product-tile'], article[class*='product-tile']")
+
+    # 3. Any element carrying a stockcode/productid data attribute
+    if not tiles:
+        tiles = soup.select("[data-stockcode], [data-productid], [data-product-id]")
+
+    if not tiles:
+        # Log rendered HTML so we can identify the correct selector in one fix
+        log.warning(f"Woolworths {slug}: no product tiles found (len={len(html)})")
+        log.warning(f"Woolworths {slug} rendered snippet: {html[5000:8000]}")
+        return []
+
+    log.info(f"Woolworths {slug}: {len(tiles)} tiles found")
+
+    for tile in tiles:
+        # --- Product name ---
+        # Try heading tags first, then any element with 'name' or 'title' in class
+        name_el = (
+            tile.select_one("h2, h3, h4")
+            or tile.select_one("[class*='title'], [class*='name'], [class*='description']")
+        )
+        name = name_el.get_text(strip=True) if name_el else ""
+
+        # Fall back to data attributes
+        if not name:
+            name = (
+                tile.get("data-name")
+                or tile.get("data-product-name")
+                or tile.get("title")
+                or ""
+            ).strip()
+
+        if not name or len(name) < 3:
+            continue
+
+        # --- Price ---
+        # Woolworths renders current price in a "price" element
+        price_el = (
+            tile.select_one("[class*='price--now'], [class*='price-now']")
+            or tile.select_one("[class*='primary'] [class*='price']")
+            or tile.select_one("[class*='price']")
+        )
+        price_text = price_el.get_text(strip=True) if price_el else ""
+        price = _extract_price(price_text)
+        if price is None or price <= 0:
+            continue
+
+        # --- Was-price ---
+        was_el = (
+            tile.select_one("[class*='price--was'], [class*='was-price'], [class*='price-was']")
+            or tile.select_one("[class*='was']")
+        )
+        was_text = was_el.get_text(strip=True) if was_el else ""
+        was_price = _extract_price(was_text)
+
+        # --- Deduplicate ---
+        stockcode = tile.get("data-stockcode") or tile.get("data-productid") or name
+        if stockcode in seen:
+            continue
+        seen.add(stockcode)
+
+        # --- Image ---
+        img_el = tile.find("img")
+        img_url = None
+        if img_el:
+            src = img_el.get("src") or img_el.get("data-src") or ""
+            if src.startswith("http"):
+                img_url = src
+
+        # --- Unit ---
+        unit_el = tile.select_one("[class*='cup'], [class*='unit'], [class*='measure']")
+        unit = unit_el.get_text(strip=True) if unit_el else "ea"
+        unit = re.sub(r"\s+", " ", unit).strip() or "ea"
+
+        products.append(ProductRecord(
+            name=name,
+            category=_categorise(name, default_cat),
+            woolies_price=price,
+            woolies_was_price=was_price,
+            unit=unit,
+            image_url=img_url,
+            last_updated=now,
+        ))
+
+    return products
+
+
+def _extract_price(text: str) -> Optional[float]:
+    m = re.search(r"\$?\s*(\d+\.\d{2})", text.replace(",", ""))
+    if m:
+        return float(m.group(1))
+    m = re.search(r"\$\s*(\d+)\b", text)
+    if m:
+        return float(m.group(1))
+    return None
 
 
 def scrape() -> tuple[list[ProductRecord], Optional[str]]:
-    build_id = _get_build_id()
-    if not build_id:
-        return [], "Could not get Woolworths buildId from specials page"
+    if not SCRAPINGBEE_KEY:
+        return [], "SCRAPINGBEE_API_KEY not set"
 
     now = datetime.datetime.utcnow().isoformat()
-    seen: set[int] = set()
+    seen: set[str] = set()
     products: list[ProductRecord] = []
     last_error: Optional[str] = None
 
     for slug, default_cat in SPECIALS_CATEGORIES:
+        url = f"{BASE}/shop/specials/half-price/{slug}"
         try:
-            url = f"{BASE}/_next/data/{build_id}/shop/specials/half-price/{slug}.json"
-            r = _get(url)
+            r = _fetch_rendered(url)
+            log.info(f"Woolworths {slug}: ScrapingBee HTTP {r.status_code} len={len(r.text)}")
+
             if not r.ok:
-                log.warning(f"Woolworths _next {slug}: HTTP {r.status_code}")
-                last_error = f"HTTP {r.status_code} for {slug}"
-                time.sleep(0.5)
+                last_error = f"ScrapingBee HTTP {r.status_code} for {slug}"
+                time.sleep(1)
                 continue
 
-            try:
-                data = r.json()
-            except Exception:
-                log.warning(f"Woolworths _next {slug}: non-JSON response {r.text[:200]}")
-                last_error = f"Non-JSON response for {slug}"
-                time.sleep(0.5)
-                continue
+            page_products = _parse_tiles(r.text, slug, default_cat, now, seen)
+            products.extend(page_products)
 
-            page_props = data.get("pageProps", {})
-            items = _extract_items(page_props, slug)
-            log.info(f"Woolworths {slug}: {len(items)} products")
-
-            for item in items:
-                stockcode = item.get("Stockcode") or item.get("stockcode")
-                if stockcode and stockcode in seen:
-                    continue
-                if stockcode:
-                    seen.add(stockcode)
-
-                price = item.get("Price") or item.get("price")
-                if not price or float(price) <= 0:
-                    continue
-
-                name = (item.get("Name") or item.get("name") or "").strip()
-                if not name:
-                    continue
-
-                was = item.get("WasPrice") or item.get("wasPrice")
-                img = item.get("MediumImageFile") or item.get("LargeImageFile") or ""
-                unit = item.get("PackageSize") or item.get("CupMeasure") or "ea"
-
-                products.append(ProductRecord(
-                    name=name,
-                    category=_categorise(name, default_cat),
-                    woolies_price=float(price),
-                    woolies_was_price=float(was) if was else None,
-                    unit=unit,
-                    image_url=img if img.startswith("http") else None,
-                    last_updated=now,
-                ))
+            if not page_products:
+                last_error = f"No tiles parsed for {slug}"
 
         except Exception as e:
             last_error = f"Error on {slug}: {e}"
             log.warning(f"Woolworths {slug} exception: {e}")
 
-        time.sleep(0.5)
+        time.sleep(1)
 
-    return products, last_error if not products else None
+    return (products, None) if products else ([], last_error or "No Woolworths products found")
