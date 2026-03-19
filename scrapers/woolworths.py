@@ -17,7 +17,6 @@ Free tier = 1,000 credits/month ≈ 16 syncs/month.
 import os
 import re
 import json
-import base64
 import time
 import datetime
 import logging
@@ -76,13 +75,14 @@ def _categorise(name: str, default_cat: str) -> str:
 
 def _build_scenario(cat_id: str, url_path: str) -> str:
     """
-    Build a base64-encoded ScrapingBee js_scenario that:
+    Build a ScrapingBee js_scenario JSON string that:
       - Waits 5 s for Akamai challenge + Angular bootstrap
       - Calls the browse API via fetch() from the authenticated browser context
       - Stores the JSON response in <script id="wdata" type="application/json">
       - Waits 8 s for the fetch to resolve
+
+    js_scenario expects a plain JSON string (NOT base64).
     """
-    # Build the JS fetch body as an object literal (no nested quoting issues)
     js = (
         "var d={"
         f"CategoryId:'{cat_id}',"
@@ -104,12 +104,11 @@ def _build_scenario(cat_id: str, url_path: str) -> str:
         "});"
     )
 
-    scenario = json.dumps([
+    return json.dumps([
         {"wait": 5000},
         {"evaluate": js},
         {"wait": 8000},
     ])
-    return base64.b64encode(scenario.encode()).decode()
 
 
 def _fetch_category(cat_id: str, url_path: str) -> Optional[dict]:
