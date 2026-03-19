@@ -13,6 +13,7 @@ are not protected by the same Akamai rules as the browser API endpoints.
 """
 
 import re
+import os
 import time
 import json
 import datetime
@@ -25,17 +26,19 @@ from database import ProductRecord
 log = logging.getLogger(__name__)
 
 BASE = "https://www.woolworths.com.au"
+SCRAPINGBEE_KEY = os.environ.get("SCRAPINGBEE_API_KEY", "")
+SCRAPINGBEE_URL = "https://app.scrapingbee.com/api/v1/"
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/122.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-AU,en;q=0.9",
-    "Referer": f"{BASE}/",
-}
+
+def _get(url: str, timeout: int = 30) -> requests.Response:
+    """Fetch a URL, routing through ScrapingBee if an API key is configured."""
+    if SCRAPINGBEE_KEY:
+        return requests.get(
+            SCRAPINGBEE_URL,
+            params={"api_key": SCRAPINGBEE_KEY, "url": url, "render_js": "false"},
+            timeout=timeout,
+        )
+    return requests.get(url, timeout=timeout)
 
 # URL slug → display category
 SPECIALS_CATEGORIES = [
@@ -79,10 +82,10 @@ def _categorise(name: str, default_cat: str) -> str:
     return default_cat
 
 
-def _get_build_id(session: requests.Session) -> Optional[str]:
+def _get_build_id() -> Optional[str]:
     """Extract Next.js buildId from the Woolworths specials page."""
     try:
-        r = session.get(f"{BASE}/shop/specials/half-price", timeout=30)
+        r = _get(f"{BASE}/shop/specials/half-price")
         log.info(f"Woolworths specials page: HTTP {r.status_code}")
         if not r.ok:
             return None
@@ -126,10 +129,7 @@ def _extract_items(page_props: dict, slug: str) -> list[dict]:
 
 
 def scrape() -> tuple[list[ProductRecord], Optional[str]]:
-    session = requests.Session()
-    session.headers.update(HEADERS)
-
-    build_id = _get_build_id(session)
+    build_id = _get_build_id()
     if not build_id:
         return [], "Could not get Woolworths buildId from specials page"
 
@@ -141,7 +141,7 @@ def scrape() -> tuple[list[ProductRecord], Optional[str]]:
     for slug, default_cat in SPECIALS_CATEGORIES:
         try:
             url = f"{BASE}/_next/data/{build_id}/shop/specials/half-price/{slug}.json"
-            r = session.get(url, timeout=30)
+            r = _get(url)
             if not r.ok:
                 log.warning(f"Woolworths _next {slug}: HTTP {r.status_code}")
                 last_error = f"HTTP {r.status_code} for {slug}"
