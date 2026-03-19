@@ -147,20 +147,8 @@ def scrape(max_categories: int = len(SPECIALS_CATEGORIES)) -> tuple[list[Product
                     break
                 all_items.extend(page_items)
 
-            # Process items — keep those on special or with a reduced WasPrice
+            # API already filters with IsSpecial=True — accept all returned items
             for item in all_items:
-                is_special = (
-                    item.get("IsOnSpecial")
-                    or item.get("IsHalfPrice")
-                    or (
-                        item.get("WasPrice")
-                        and item.get("Price")
-                        and float(item["WasPrice"]) > float(item["Price"])
-                    )
-                )
-                if not is_special:
-                    continue
-
                 stockcode = item.get("Stockcode")
                 if stockcode and stockcode in seen:
                     continue
