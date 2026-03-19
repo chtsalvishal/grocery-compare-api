@@ -86,16 +86,34 @@ def _get_build_id() -> Optional[str]:
     """Extract Next.js buildId from the Woolworths specials page."""
     try:
         r = _get(f"{BASE}/shop/specials/half-price")
-        log.info(f"Woolworths specials page: HTTP {r.status_code}")
+        log.info(f"Woolworths specials page: HTTP {r.status_code} len={len(r.text)}")
         if not r.ok:
             return None
-        tag = BeautifulSoup(r.text, "lxml").find("script", {"id": "__NEXT_DATA__"})
-        if not tag:
-            log.warning("Woolworths: no __NEXT_DATA__ on specials page")
-            return None
-        build_id = json.loads(tag.string).get("buildId")
-        log.info(f"Woolworths buildId: {build_id}")
-        return build_id
+
+        html = r.text
+
+        # Method 1: __NEXT_DATA__ script tag (standard Next.js SSR)
+        tag = BeautifulSoup(html, "lxml").find("script", {"id": "__NEXT_DATA__"})
+        if tag:
+            build_id = json.loads(tag.string).get("buildId")
+            log.info(f"Woolworths buildId (NEXT_DATA): {build_id}")
+            return build_id
+
+        # Method 2: buildId embedded in inline script as JSON string
+        m = re.search(r'"buildId"\s*:\s*"([^"]+)"', html)
+        if m:
+            log.info(f"Woolworths buildId (inline script): {m.group(1)}")
+            return m.group(1)
+
+        # Method 3: infer from /_next/static/{buildId}/ path references
+        m = re.search(r'/_next/static/([^/"]+)/', html)
+        if m:
+            log.info(f"Woolworths buildId (static path): {m.group(1)}")
+            return m.group(1)
+
+        # Log a snippet to diagnose what the page looks like
+        log.warning(f"Woolworths: no buildId found. Page snippet: {html[:500]}")
+        return None
     except Exception as e:
         log.warning(f"Woolworths buildId error: {e}")
         return None
