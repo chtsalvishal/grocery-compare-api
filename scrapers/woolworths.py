@@ -82,6 +82,8 @@ def _categorise(name: str, default_cat: str) -> str:
     return default_cat
 
 
+import logging as _log
+
 def _fetch_category_page(
     session: requests.Session,
     cat_id: str,
@@ -103,25 +105,28 @@ def _fetch_category_page(
         timeout=30,
     )
     if not resp.ok:
+        _log.warning(f"Woolworths browse API HTTP {resp.status_code} for {url_path}")
         return [], 0
 
-    data = resp.json()
+    try:
+        data = resp.json()
+    except Exception:
+        _log.warning(f"Woolworths non-JSON response for {url_path}: {resp.text[:200]}")
+        return [], 0
+
     total = data.get("TotalRecordCount") or 0
     bundles = data.get("Bundles") or []
     items = [item for bundle in bundles for item in (bundle.get("Products") or [])]
+    if page == 1:
+        _log.info(f"Woolworths {url_path}: total={total} bundles={len(bundles)} items={len(items)}")
     return items, total
 
 
 def scrape(max_categories: int = len(SPECIALS_CATEGORIES)) -> tuple[list[ProductRecord], Optional[str]]:
     session = requests.Session()
     session.headers.update(HEADERS)
-
-    # Warmup — establishes Akamai session cookies
-    try:
-        session.get(f"{BASE}/", timeout=30)
-        time.sleep(1.5)
-    except Exception as e:
-        return [], f"Warmup failed: {e}"
+    # No homepage warmup — on cloud IPs Akamai serves a JS challenge we can't
+    # execute, which poisons the session with invalid bot-detection cookies.
 
     now = datetime.datetime.utcnow().isoformat()
     seen: set[int] = set()
