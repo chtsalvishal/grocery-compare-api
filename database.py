@@ -1,11 +1,16 @@
-from sqlalchemy import create_engine, Column, String, Float, text
+from sqlalchemy import create_engine, Column, String, Float
 from sqlalchemy.orm import DeclarativeBase, Session
 from typing import Optional
 import datetime
+import os
 import re
 import difflib
+import threading
 
-engine = create_engine("sqlite:///specials.db", connect_args={"check_same_thread": False})
+_db_write_lock = threading.Lock()
+
+_db_url = os.environ.get("DATABASE_URL", "sqlite:///specials.db")
+engine = create_engine(_db_url, connect_args={"check_same_thread": False})
 
 
 class Base(DeclarativeBase):
@@ -38,11 +43,17 @@ def get_all_products() -> list[ProductRecord]:
 
 def clear_store_prices(store: str):
     """Zero out prices for one store before re-syncing so stale data is removed."""
-    with Session(engine) as session:
-        col_map = {"coles": "coles_price", "woolies": "woolies_price", "aldi": "aldi_price"}
-        col = col_map.get(store.lower())
-        if col:
-            session.execute(text(f"UPDATE products SET {col} = NULL"))
+    col_map = {
+        "coles":   ProductRecord.coles_price,
+        "woolies": ProductRecord.woolies_price,
+        "aldi":    ProductRecord.aldi_price,
+    }
+    col_attr = col_map.get(store.lower())
+    if col_attr is None:
+        return
+    with _db_write_lock:
+        with Session(engine) as session:
+            session.query(ProductRecord).update({col_attr: None}, synchronize_session=False)
             session.commit()
 
 
@@ -76,93 +87,95 @@ def merge_products():
         n = re.sub(r"\s+", " ", n).strip()
         return n
 
-    with Session(engine) as session:
-        all_records: list[ProductRecord] = session.query(ProductRecord).all()
+    with _db_write_lock:
+        with Session(engine) as session:
+            all_records: list[ProductRecord] = session.query(ProductRecord).all()
 
-        # Build list of (normalised_name, record)
-        normed = [(_normalise(r.name), r) for r in all_records]
+            # Build list of (normalised_name, record)
+            normed = [(_normalise(r.name), r) for r in all_records]
 
-        merged_count = 0
-        # Track which primary keys have already been consumed in a merge
-        consumed: set[str] = set()
+            merged_count = 0
+            # Track which primary keys have already been consumed in a merge
+            consumed: set[str] = set()
 
-        for i, (norm_i, rec_i) in enumerate(normed):
-            if rec_i.name in consumed:
-                continue
-            for j in range(i + 1, len(normed)):
-                norm_j, rec_j = normed[j]
-                if rec_j.name in consumed:
+            for i, (norm_i, rec_i) in enumerate(normed):
+                if rec_i.name in consumed:
                     continue
+                for j in range(i + 1, len(normed)):
+                    norm_j, rec_j = normed[j]
+                    if rec_j.name in consumed:
+                        continue
 
-                ratio = difflib.SequenceMatcher(None, norm_i, norm_j).ratio()
-                if ratio < 0.80:
-                    continue
+                    ratio = difflib.SequenceMatcher(None, norm_i, norm_j).ratio()
+                    if ratio < 0.80:
+                        continue
 
-                # Decide winner = longer (more detailed) name
-                if len(rec_j.name) > len(rec_i.name):
-                    winner, loser = rec_j, rec_i
-                else:
-                    winner, loser = rec_i, rec_j
+                    # Decide winner = longer (more detailed) name
+                    if len(rec_j.name) > len(rec_i.name):
+                        winner, loser = rec_j, rec_i
+                    else:
+                        winner, loser = rec_i, rec_j
 
-                # Merge loser's prices into winner where winner has none
-                if loser.coles_price is not None and winner.coles_price is None:
-                    winner.coles_price = loser.coles_price
-                    winner.coles_was_price = loser.coles_was_price
-                if loser.woolies_price is not None and winner.woolies_price is None:
-                    winner.woolies_price = loser.woolies_price
-                    winner.woolies_was_price = loser.woolies_was_price
-                if loser.aldi_price is not None and winner.aldi_price is None:
-                    winner.aldi_price = loser.aldi_price
-                    winner.aldi_was_price = loser.aldi_was_price
-                if loser.image_url and not winner.image_url:
-                    winner.image_url = loser.image_url
+                    # Merge loser's prices into winner where winner has none
+                    if loser.coles_price is not None and winner.coles_price is None:
+                        winner.coles_price = loser.coles_price
+                        winner.coles_was_price = loser.coles_was_price
+                    if loser.woolies_price is not None and winner.woolies_price is None:
+                        winner.woolies_price = loser.woolies_price
+                        winner.woolies_was_price = loser.woolies_was_price
+                    if loser.aldi_price is not None and winner.aldi_price is None:
+                        winner.aldi_price = loser.aldi_price
+                        winner.aldi_was_price = loser.aldi_was_price
+                    if loser.image_url and not winner.image_url:
+                        winner.image_url = loser.image_url
 
-                # Use the best category (non-generic wins)
-                if winner.category in ("Weekly Specials", None) and loser.category not in ("Weekly Specials", None):
-                    winner.category = loser.category
+                    # Use the best category (non-generic wins)
+                    if winner.category in ("Weekly Specials", None) and loser.category not in ("Weekly Specials", None):
+                        winner.category = loser.category
 
-                # Re-fresh winner in session and delete loser
-                db_winner = session.get(ProductRecord, winner.name)
-                db_loser = session.get(ProductRecord, loser.name)
-                if db_winner and db_loser:
-                    db_winner.coles_price = winner.coles_price
-                    db_winner.coles_was_price = winner.coles_was_price
-                    db_winner.woolies_price = winner.woolies_price
-                    db_winner.woolies_was_price = winner.woolies_was_price
-                    db_winner.aldi_price = winner.aldi_price
-                    db_winner.aldi_was_price = winner.aldi_was_price
-                    db_winner.image_url = winner.image_url
-                    db_winner.category = winner.category
-                    session.delete(db_loser)
-                    consumed.add(loser.name)
-                    merged_count += 1
+                    # Re-fresh winner in session and delete loser
+                    db_winner = session.get(ProductRecord, winner.name)
+                    db_loser = session.get(ProductRecord, loser.name)
+                    if db_winner and db_loser:
+                        db_winner.coles_price = winner.coles_price
+                        db_winner.coles_was_price = winner.coles_was_price
+                        db_winner.woolies_price = winner.woolies_price
+                        db_winner.woolies_was_price = winner.woolies_was_price
+                        db_winner.aldi_price = winner.aldi_price
+                        db_winner.aldi_was_price = winner.aldi_was_price
+                        db_winner.image_url = winner.image_url
+                        db_winner.category = winner.category
+                        session.delete(db_loser)
+                        consumed.add(loser.name)
+                        merged_count += 1
 
-        session.commit()
+            session.commit()
 
     return merged_count
 
 
 def upsert_products(records: list[ProductRecord]):
     """Merge incoming records into the DB, updating prices per store."""
-    with Session(engine) as session:
-        for p in records:
-            existing = session.get(ProductRecord, p.name)
-            if existing:
-                # Only overwrite the fields that came in non-null
-                if p.coles_price is not None:
-                    existing.coles_price = p.coles_price
-                    existing.coles_was_price = p.coles_was_price
-                if p.woolies_price is not None:
-                    existing.woolies_price = p.woolies_price
-                    existing.woolies_was_price = p.woolies_was_price
-                if p.aldi_price is not None:
-                    existing.aldi_price = p.aldi_price
-                    existing.aldi_was_price = p.aldi_was_price
-                if p.unit and p.unit != "ea":
-                    existing.unit = p.unit
-                if p.image_url:
-                    existing.image_url = p.image_url
-                existing.last_updated = p.last_updated
-            else:
-                session.add(p)
-        session.commit()
+    with _db_write_lock:
+        with Session(engine) as session:
+            for p in records:
+                existing = session.get(ProductRecord, p.name)
+                if existing:
+                    # Only overwrite the fields that came in non-null
+                    if p.coles_price is not None:
+                        existing.coles_price = p.coles_price
+                        existing.coles_was_price = p.coles_was_price
+                    if p.woolies_price is not None:
+                        existing.woolies_price = p.woolies_price
+                        existing.woolies_was_price = p.woolies_was_price
+                    if p.aldi_price is not None:
+                        existing.aldi_price = p.aldi_price
+                        existing.aldi_was_price = p.aldi_was_price
+                    if p.unit and p.unit != "ea":
+                        existing.unit = p.unit
+                    if p.image_url:
+                        existing.image_url = p.image_url
+                    existing.last_updated = p.last_updated
+                else:
+                    session.add(p)
+            session.commit()

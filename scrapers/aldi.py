@@ -21,8 +21,24 @@ import time
 import requests
 from bs4 import BeautifulSoup
 from typing import Optional
+from urllib.parse import urlparse
 from database import ProductRecord
 import datetime
+
+_ALLOWED_IMAGE_HOSTS = {
+    "cdn0.woolworths.com.au",
+    "www.woolworths.com.au",
+    "productimages.coles.com.au",
+    "www.coles.com.au",
+    "www.aldi.com.au",
+}
+
+
+def _safe_image_url(url: str) -> str | None:
+    if not url or not url.startswith("https://"):
+        return None
+    host = urlparse(url).hostname or ""
+    return url if host in _ALLOWED_IMAGE_HOSTS else None
 
 BASE = "https://www.aldi.com.au"
 
@@ -136,8 +152,7 @@ def _parse_tiles(html: str, now: str, default_cat: str, seen: set[str]) -> list[
         img_url = None
         if img:
             src = img.get("src") or img.get("data-src") or ""
-            if src and src.startswith("http"):
-                img_url = src
+            img_url = _safe_image_url(src)
 
         products.append(ProductRecord(
             name=full_name,

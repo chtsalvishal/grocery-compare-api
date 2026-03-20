@@ -14,13 +14,18 @@ Endpoints:
 import datetime
 import logging
 import os
+import secrets
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import asynccontextmanager
 
 from apscheduler.schedulers.background import BackgroundScheduler
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Header, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
+from starlette.requests import Request
 
 from database import get_all_products, upsert_products, clear_store_prices, merge_products
 from models import SpecialProduct, SyncResult, SyncStatus
@@ -28,12 +33,23 @@ import scrapers.woolworths as wools_scraper
 import scrapers.coles as coles_scraper
 import scrapers.aldi as aldi_scraper
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+_log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=getattr(logging, _log_level, logging.INFO), format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Sync logic
 # ---------------------------------------------------------------------------
+
+_SYNC_API_KEY = os.environ.get("SYNC_API_KEY", "")
+
+
+def _check_sync_key(x_api_key: str = Header(default="")) -> None:
+    if not _SYNC_API_KEY:
+        return  # key not configured — open (dev mode)
+    if not secrets.compare_digest(x_api_key, _SYNC_API_KEY):
+        raise HTTPException(status_code=403, detail="Invalid API key")
+
 
 _last_sync: SyncResult | None = None
 
@@ -72,8 +88,8 @@ def run_sync() -> SyncResult:
     for store, _ in scrapers:          # preserve insertion order
         records, error = scrape_results.get(store, ([], "scrape did not complete"))
         if error and not records:
-            log.warning(f"{store} failed: {error}")
-            statuses.append(SyncStatus(store=store, status="error", error=error))
+            log.error(f"{store} scrape error: {error}")
+            statuses.append(SyncStatus(store=store, status="error", error="Scrape failed"))
             continue
 
         store_key = store.lower().replace("woolworths", "woolies")
@@ -136,12 +152,18 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# allow_origins=["*"] is intentional: this API serves Android native clients,
+# which are not subject to browser CORS restrictions.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
+
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 
 # ---------------------------------------------------------------------------
@@ -153,17 +175,16 @@ def health():
     return {"status": "ok", "timestamp": datetime.datetime.utcnow().isoformat()}
 
 
+@limiter.limit("30/minute")
 @app.get("/api/specials", response_model=list[SpecialProduct])
 def get_specials(
-    category: str | None = Query(default=None, description="Filter by category name"),
-    store: str | None = Query(default=None, description="Filter: coles | woolies | aldi"),
-    q: str | None = Query(default=None, description="Search product name"),
-    sort: str | None = Query(
-        default="multi_store",
-        description=(
-            "Sort order: multi_store (default) | price_asc | price_desc | savings | az"
-        ),
-    ),
+    request: Request,
+    category: str | None = Query(default=None, max_length=100),
+    store: str | None = Query(default=None, max_length=20),
+    q: str | None = Query(default=None, max_length=100),
+    sort: str | None = Query(default="multi_store", max_length=20),
+    skip: int = Query(default=0, ge=0),
+    limit: int = Query(default=200, ge=1, le=1000),
 ):
     """
     Return all current specials from the DB.
@@ -257,14 +278,15 @@ def get_specials(
         # Default: multi_store — products at more stores first, then alphabetically
         results.sort(key=lambda p: (-_store_count(p), p.name.lower()))
 
-    return results
+    return results[skip : skip + limit]
 
 
-@app.post("/api/sync", response_model=SyncResult)
-def trigger_sync():
-    """Manually trigger a sync. Intended for admin/testing use."""
-    result = run_sync()
-    return result
+@limiter.limit("2/minute")
+@app.post("/api/sync", status_code=202)
+def trigger_sync(request: Request, background_tasks: BackgroundTasks, _: None = Depends(_check_sync_key)):
+    """Trigger a sync in the background. Requires X-Api-Key header."""
+    background_tasks.add_task(run_sync)
+    return {"status": "sync started"}
 
 
 @app.get("/api/sync/status", response_model=SyncResult | None)

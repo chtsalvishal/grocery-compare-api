@@ -17,8 +17,24 @@ import datetime
 import requests
 from bs4 import BeautifulSoup
 from typing import Optional
+from urllib.parse import urlparse
 
 from database import ProductRecord
+
+_ALLOWED_IMAGE_HOSTS = {
+    "cdn0.woolworths.com.au",
+    "www.woolworths.com.au",
+    "productimages.coles.com.au",
+    "www.coles.com.au",
+    "www.aldi.com.au",
+}
+
+
+def _safe_image_url(url: str) -> str | None:
+    if not url or not url.startswith("https://"):
+        return None
+    host = urlparse(url).hostname or ""
+    return url if host in _ALLOWED_IMAGE_HOSTS else None
 
 BASE = "https://www.coles.com.au"
 IMG_BASE = "https://productimages.coles.com.au/productimages"
@@ -153,7 +169,7 @@ def scrape() -> tuple[list[ProductRecord], Optional[str]]:
                 if img_uris and isinstance(img_uris[0], dict):
                     uri = img_uris[0].get("uri", "")
                     if uri:
-                        img_url = f"{IMG_BASE}{uri}"
+                        img_url = _safe_image_url(f"{IMG_BASE}{uri}")
 
                 products.append(ProductRecord(
                     name=name,

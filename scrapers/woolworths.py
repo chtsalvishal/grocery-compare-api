@@ -18,10 +18,26 @@ import asyncio
 import datetime
 import logging
 from typing import Optional
+from urllib.parse import urlparse
 
 from curl_cffi.requests import AsyncSession
 
 from database import ProductRecord
+
+_ALLOWED_IMAGE_HOSTS = {
+    "cdn0.woolworths.com.au",
+    "www.woolworths.com.au",
+    "productimages.coles.com.au",
+    "www.coles.com.au",
+    "www.aldi.com.au",
+}
+
+
+def _safe_image_url(url: str) -> str | None:
+    if not url or not url.startswith("https://"):
+        return None
+    host = urlparse(url).hostname or ""
+    return url if host in _ALLOWED_IMAGE_HOSTS else None
 
 log = logging.getLogger(__name__)
 
@@ -199,7 +215,7 @@ async def _scrape_async(now: str) -> tuple[list[ProductRecord], Optional[str]]:
                         woolies_price=price_val,
                         woolies_was_price=float(was) if was else None,
                         unit=unit,
-                        image_url=img if img.startswith("http") else None,
+                        image_url=_safe_image_url(img),
                         last_updated=now,
                     ))
 
