@@ -72,7 +72,7 @@ def _categorise(name: str, default_cat: str) -> str:
         return "Personal Care"
     if any(w in n for w in ["cleaning", "detergent", "paper", "tissue", "bin", "nappy", "dishwash", "bleach"]):
         return "Household"
-    return default_cat
+    return "Weekly Specials"
 
 
 def _build_scenario(cat_id: str, url_path: str) -> str:
