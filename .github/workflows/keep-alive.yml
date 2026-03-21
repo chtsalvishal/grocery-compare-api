@@ -1,0 +1,35 @@
+name: Keep Render Alive
+
+on:
+  schedule:
+    - cron: '*/9 * * * *'   # every 9 minutes — well under Render's 15-min sleep threshold
+  workflow_dispatch:          # allow manual trigger from GitHub Actions UI
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Check service is up, then keep alive
+        run: |
+          URL="${{ secrets.BACKEND_URL }}/api/health"
+          MAX_ATTEMPTS=6
+          WAIT_SECONDS=15
+
+          echo "Pinging: $URL"
+
+          for i in $(seq 1 $MAX_ATTEMPTS); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 "$URL" || echo "000")
+
+            if [ "$STATUS" = "200" ]; then
+              echo "Service is alive (attempt $i) — keep-alive ping successful"
+              exit 0
+            fi
+
+            echo "Attempt $i/$MAX_ATTEMPTS: status=$STATUS — service not ready, retrying in ${WAIT_SECONDS}s..."
+            sleep $WAIT_SECONDS
+          done
+
+          echo "Service did not respond after $MAX_ATTEMPTS attempts"
+          exit 1
