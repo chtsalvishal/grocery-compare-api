@@ -39,7 +39,7 @@ def _safe_image_url(url: str) -> str | None:
 BASE = "https://www.coles.com.au"
 IMG_BASE = "https://productimages.coles.com.au/productimages"
 PAGE_SIZE = 48
-MAX_PAGES = 10   # 10 × 48 = up to 480 specials per sync
+MAX_PAGES = 25   # 25 × 48 = up to 1,200 specials per sync
 
 HEADERS_HTML = {
     "User-Agent": (

@@ -1,22 +1,22 @@
 """
 Woolworths specials scraper — free, no proxy required.
 
-Replaces the ScrapingBee/browser approach entirely.
+Strategy: browse the Woolworths specials category directly
+  1. Fetch page 1 of /apis/ui/browse/category?categoryId=specialsland
+     to get TotalRecordCount and the first batch of products.
+  2. Calculate remaining pages and fetch them all in parallel batches
+     of CONCURRENCY (8 concurrent requests).
+  3. Keep products where IsHalfPrice=True OR WasPrice > Price.
+  4. Deduplicate by Stockcode.
 
-Strategy: async search-API sweep
-  1. Call GET /apis/ui/Search/products for 90 grocery terms, pages 1-2
-     (8 concurrent requests, ~25 seconds total)
-  2. Keep products where IsHalfPrice=True OR WasPrice > Price
-  3. Deduplicate by Stockcode
-  4. Map to ProductRecord — same interface as before
-
-No SCRAPINGBEE_API_KEY, no browser, no proxy needed.
-Proven via GitHub Actions tests: ~400 unique half-price products per run.
+This replaces the old keyword-search approach which only captured ~400
+products. The browse approach returns ALL current specials (~1000+).
 """
 
 import asyncio
 import datetime
 import logging
+import math
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -39,11 +39,14 @@ def _safe_image_url(url: str) -> str | None:
     host = urlparse(url).hostname or ""
     return url if host in _ALLOWED_IMAGE_HOSTS else None
 
+
 log = logging.getLogger(__name__)
 
-BASE = "https://www.woolworths.com.au"
-CONCURRENCY = 8   # concurrent requests — safe without triggering rate limits
-TIMEOUT = 20
+BASE        = "https://www.woolworths.com.au"
+CONCURRENCY = 8
+TIMEOUT     = 20
+PAGE_SIZE   = 36
+MAX_PAGES   = 60   # 60 × 36 = up to 2,160 specials
 
 HEADERS = {
     "User-Agent": (
@@ -56,43 +59,6 @@ HEADERS = {
     "Referer": f"{BASE}/shop/specials/half-price",
     "Origin": BASE,
 }
-
-# 90 terms covering every major Woolworths half-price category.
-# Proven to yield ~400 unique half-price products across pages 1+2.
-SEARCH_TERMS = [
-    # Snacks & confectionery — highest half-price yield
-    "lollies", "chocolate", "biscuits", "chips", "crackers", "muesli bar",
-    "popcorn", "shapes", "licorice", "caramel", "gummy", "twisties",
-    "tim tam", "pretzels",
-    # Beverages
-    "cola", "soft drink", "energy drink", "sports drink", "iced tea",
-    "sparkling water", "cordial", "juice",
-    # Cleaning & household — very high yield
-    "detergent", "bleach", "dishwasher tablets", "spray cleaner",
-    # Personal care
-    "deodorant", "shampoo", "conditioner", "body wash", "toothpaste",
-    "face wash", "moisturiser", "sunscreen", "razors",
-    # Health & vitamins
-    "vitamins", "protein bar",
-    # Meat & seafood
-    "bacon", "chicken", "steak", "sausages", "ham", "turkey", "fish",
-    "salmon", "tuna", "prawns", "lamb", "pork", "mince",
-    # Dairy & fridge
-    "yoghurt", "cheese", "butter", "cream cheese", "dip", "cream", "feta",
-    # Bread & bakery
-    "bread", "rolls", "wraps", "crumpets",
-    # Breakfast
-    "cereal", "muesli", "oats",
-    # Frozen
-    "ice cream", "frozen pizza", "frozen chips", "frozen vegetables",
-    # Pantry
-    "soup", "rice", "coffee", "tea", "pasta sauce", "baked beans",
-    "olive oil", "coconut milk",
-    # Baby & pet
-    "nappy", "baby food", "dog food", "cat food",
-    # Alcohol
-    "beer", "wine", "cider", "premix",
-]
 
 
 def _categorise(name: str) -> str:
@@ -124,102 +90,133 @@ def _categorise(name: str) -> str:
     return "Weekly Specials"
 
 
-async def _fetch_page(session: AsyncSession, term: str, page: int) -> list[dict]:
-    """Fetch one page of search results and return the flat product list."""
+def _flatten(data: dict) -> tuple[list[dict], int]:
+    """Extract flat product list and total record count from an API response."""
+    total = (
+        data.get("TotalRecordCount")
+        or data.get("SearchResultsCount")
+        or 0
+    )
+    # Browse endpoint returns Bundles; search endpoint returns Products
+    outer = data.get("Bundles") or data.get("Products") or []
+    flat: list[dict] = []
+    for item in outer:
+        inner = item.get("Products") or []
+        if inner:
+            flat.extend(inner)
+        elif item.get("Stockcode"):
+            flat.append(item)
+    return flat, int(total)
+
+
+async def _fetch_page(session: AsyncSession, page: int) -> tuple[list[dict], int]:
+    """Fetch one page from the Woolworths specials browse endpoint."""
     try:
         r = await session.get(
-            f"{BASE}/apis/ui/Search/products",
+            f"{BASE}/apis/ui/browse/category",
             params={
-                "searchTerm": term,
-                "pageNumber": page,
-                "pageSize": 36,
-                "sortType": "TraderRelevance",
-                "isFeatured": "false",
+                "categoryId":  "specialsland",
+                "pageNumber":  page,
+                "pageSize":    PAGE_SIZE,
+                "sortType":    "TraderRelevance",
+                "isFeatured":  "false",
             },
             headers=HEADERS,
             timeout=TIMEOUT,
         )
         if r.status_code != 200:
-            return []
-        data = r.json()
-        # Flatten the nested Products structure
-        outer = data.get("Products") or []
-        flat = []
-        for item in outer:
-            inner = item.get("Products") or []
-            if inner:
-                flat.extend(inner)
-            elif item.get("Stockcode"):
-                flat.append(item)
-        return flat
+            log.debug(f"Woolworths browse p{page}: HTTP {r.status_code}")
+            return [], 0
+        return _flatten(r.json())
     except Exception as e:
-        log.debug(f"Woolworths search '{term}' p{page}: {e}")
-        return []
+        log.debug(f"Woolworths browse p{page}: {e}")
+        return [], 0
+
+
+def _parse_product(item: dict, now: str) -> Optional[ProductRecord]:
+    is_half_price = item.get("IsHalfPrice", False)
+    was   = item.get("WasPrice")
+    price = item.get("Price")
+    has_discount = (
+        was and price
+        and float(was) > 0
+        and float(price) > 0
+        and float(was) > float(price)
+    )
+    if not is_half_price and not has_discount:
+        return None
+
+    price_val = float(price) if price else None
+    if not price_val or price_val <= 0:
+        return None
+
+    name = (item.get("Name") or "").strip()
+    if not name:
+        return None
+
+    img  = item.get("MediumImageFile") or item.get("LargeImageFile") or ""
+    unit = item.get("PackageSize") or item.get("CupMeasure") or "ea"
+
+    return ProductRecord(
+        name=name,
+        category=_categorise(name),
+        woolies_price=price_val,
+        woolies_was_price=float(was) if was else None,
+        unit=unit,
+        image_url=_safe_image_url(img),
+        last_updated=now,
+    )
 
 
 async def _scrape_async(now: str) -> tuple[list[ProductRecord], Optional[str]]:
     seen: set[int] = set()
     products: list[ProductRecord] = []
 
-    # Build all (term, page) tasks — page 1 and 2 for each term
-    tasks = [
-        (term, page)
-        for term in SEARCH_TERMS
-        for page in [1, 2]
-    ]
-
     async with AsyncSession(impersonate="chrome124") as session:
-        # Process in batches of CONCURRENCY
-        for i in range(0, len(tasks), CONCURRENCY):
-            batch = tasks[i : i + CONCURRENCY]
+        # Page 1 first to get total count
+        items, total = await _fetch_page(session, 1)
+        if not items and total == 0:
+            # Fall back: maybe the browse endpoint responded with empty data
+            log.warning("Woolworths browse returned no data on page 1")
+            return [], "No Woolworths specials found"
+
+        total_pages = min(MAX_PAGES, math.ceil(total / PAGE_SIZE)) if total else MAX_PAGES
+        log.info(f"Woolworths: {total} specials across {total_pages} pages")
+
+        # Process page 1
+        for item in items:
+            stockcode = item.get("Stockcode")
+            if stockcode in seen:
+                continue
+            if stockcode:
+                seen.add(stockcode)
+            record = _parse_product(item, now)
+            if record:
+                products.append(record)
+
+        # Fetch remaining pages in parallel batches
+        remaining_pages = list(range(2, total_pages + 1))
+        for i in range(0, len(remaining_pages), CONCURRENCY):
+            batch = remaining_pages[i : i + CONCURRENCY]
             results = await asyncio.gather(
-                *[_fetch_page(session, term, page) for term, page in batch],
+                *[_fetch_page(session, p) for p in batch],
                 return_exceptions=True,
             )
-            for items in results:
-                if isinstance(items, Exception) or not items:
+            for result in results:
+                if isinstance(result, Exception):
                     continue
-                for item in items:
-                    # Only keep items that are on special
-                    is_half_price = item.get("IsHalfPrice", False)
-                    was = item.get("WasPrice")
-                    price = item.get("Price")
-                    has_discount = (
-                        was and price
-                        and float(was) > 0
-                        and float(price) > 0
-                        and float(was) > float(price)
-                    )
-                    if not is_half_price and not has_discount:
-                        continue
-
+                page_items, _ = result
+                for item in page_items:
                     stockcode = item.get("Stockcode")
                     if stockcode in seen:
                         continue
                     if stockcode:
                         seen.add(stockcode)
+                    record = _parse_product(item, now)
+                    if record:
+                        products.append(record)
 
-                    price_val = float(price) if price else None
-                    if not price_val or price_val <= 0:
-                        continue
-                    name = (item.get("Name") or "").strip()
-                    if not name:
-                        continue
-
-                    img = item.get("MediumImageFile") or item.get("LargeImageFile") or ""
-                    unit = item.get("PackageSize") or item.get("CupMeasure") or "ea"
-
-                    products.append(ProductRecord(
-                        name=name,
-                        category=_categorise(name),
-                        woolies_price=price_val,
-                        woolies_was_price=float(was) if was else None,
-                        unit=unit,
-                        image_url=_safe_image_url(img),
-                        last_updated=now,
-                    ))
-
-    log.info(f"Woolworths: {len(products)} specials collected ({len(SEARCH_TERMS) * 2} API calls)")
+    log.info(f"Woolworths: {len(products)} specials collected")
     if products:
         return products, None
     return [], "No Woolworths specials found"
