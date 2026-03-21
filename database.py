@@ -4,8 +4,9 @@ from typing import Optional
 import datetime
 import os
 import re
-import difflib
 import threading
+from collections import defaultdict
+from rapidfuzz import fuzz
 
 _db_write_lock = threading.Lock()
 
@@ -59,17 +60,13 @@ def clear_store_prices(store: str):
 
 def merge_products():
     """
-    Cross-store product matching.
+    Cross-store product matching — optimised from O(n²) to near O(n).
 
-    Groups all products by normalised name (lowercase, strip brand store suffixes,
-    strip size tokens like 500g/1L/2kg). Pairs with >80% name similarity are merged
-    into a single record that carries prices from all matching stores.
-
-    When merging two records the one with the longer (more detailed) name wins.
-    The loser record is deleted from the DB; the winner record is updated with the
-    additional store prices.
-
-    Returns a count of how many merges were performed.
+    Optimisations applied:
+      1. Category bucketing   — only compare products in the same category
+      2. Length pre-filter    — skip pairs whose length ratio < 0.6 (can't reach 0.80 similarity)
+      3. Token pre-filter     — skip pairs that share no word tokens of 4+ chars
+      4. rapidfuzz            — C-extension string similarity, ~100x faster than difflib
     """
     _SIZE_RE = re.compile(
         r"\b\d+(\.\d+)?\s*(kg|g|ml|l|ltr|litre|litres|pk|pack|pcs|pieces|x\d+)\b",
@@ -83,71 +80,82 @@ def merge_products():
         n = name.lower()
         n = _STORE_WORDS.sub("", n)
         n = _SIZE_RE.sub("", n)
-        # Collapse whitespace
         n = re.sub(r"\s+", " ", n).strip()
         return n
+
+    def _tokens(norm: str) -> set[str]:
+        return {w for w in norm.split() if len(w) >= 4}
 
     with _db_write_lock:
         with Session(engine) as session:
             all_records: list[ProductRecord] = session.query(ProductRecord).all()
 
-            # Build list of (normalised_name, record)
-            normed = [(_normalise(r.name), r) for r in all_records]
+            # Fix 1: bucket by category so we only compare within-category pairs
+            buckets: dict[str, list[tuple[str, set[str], ProductRecord]]] = defaultdict(list)
+            for r in all_records:
+                norm = _normalise(r.name)
+                buckets[r.category or "Weekly Specials"].append((norm, _tokens(norm), r))
 
             merged_count = 0
-            # Track which primary keys have already been consumed in a merge
             consumed: set[str] = set()
 
-            for i, (norm_i, rec_i) in enumerate(normed):
-                if rec_i.name in consumed:
-                    continue
-                for j in range(i + 1, len(normed)):
-                    norm_j, rec_j = normed[j]
-                    if rec_j.name in consumed:
+            for category, items in buckets.items():
+                for i, (norm_i, tok_i, rec_i) in enumerate(items):
+                    if rec_i.name in consumed:
                         continue
+                    len_i = len(norm_i)
 
-                    ratio = difflib.SequenceMatcher(None, norm_i, norm_j).ratio()
-                    if ratio < 0.80:
-                        continue
+                    for j in range(i + 1, len(items)):
+                        norm_j, tok_j, rec_j = items[j]
+                        if rec_j.name in consumed:
+                            continue
 
-                    # Decide winner = longer (more detailed) name
-                    if len(rec_j.name) > len(rec_i.name):
-                        winner, loser = rec_j, rec_i
-                    else:
-                        winner, loser = rec_i, rec_j
+                        # Fix 2: length pre-filter — if lengths differ too much, ratio < 0.80 is guaranteed
+                        len_j = len(norm_j)
+                        if len_i == 0 or len_j == 0:
+                            continue
+                        if min(len_i, len_j) / max(len_i, len_j) < 0.6:
+                            continue
 
-                    # Merge loser's prices into winner where winner has none
-                    if loser.coles_price is not None and winner.coles_price is None:
-                        winner.coles_price = loser.coles_price
-                        winner.coles_was_price = loser.coles_was_price
-                    if loser.woolies_price is not None and winner.woolies_price is None:
-                        winner.woolies_price = loser.woolies_price
-                        winner.woolies_was_price = loser.woolies_was_price
-                    if loser.aldi_price is not None and winner.aldi_price is None:
-                        winner.aldi_price = loser.aldi_price
-                        winner.aldi_was_price = loser.aldi_was_price
-                    if loser.image_url and not winner.image_url:
-                        winner.image_url = loser.image_url
+                        # Fix 3: token pre-filter — must share at least one meaningful word
+                        if tok_i and tok_j and tok_i.isdisjoint(tok_j):
+                            continue
 
-                    # Use the best category (non-generic wins)
-                    if winner.category in ("Weekly Specials", None) and loser.category not in ("Weekly Specials", None):
-                        winner.category = loser.category
+                        # Fix 4: rapidfuzz — ~100x faster than difflib.SequenceMatcher
+                        if fuzz.ratio(norm_i, norm_j) < 80:
+                            continue
 
-                    # Re-fresh winner in session and delete loser
-                    db_winner = session.get(ProductRecord, winner.name)
-                    db_loser = session.get(ProductRecord, loser.name)
-                    if db_winner and db_loser:
-                        db_winner.coles_price = winner.coles_price
-                        db_winner.coles_was_price = winner.coles_was_price
-                        db_winner.woolies_price = winner.woolies_price
-                        db_winner.woolies_was_price = winner.woolies_was_price
-                        db_winner.aldi_price = winner.aldi_price
-                        db_winner.aldi_was_price = winner.aldi_was_price
-                        db_winner.image_url = winner.image_url
-                        db_winner.category = winner.category
-                        session.delete(db_loser)
-                        consumed.add(loser.name)
-                        merged_count += 1
+                        # Decide winner = longer (more detailed) name
+                        winner, loser = (rec_j, rec_i) if len(rec_j.name) > len(rec_i.name) else (rec_i, rec_j)
+
+                        if loser.coles_price is not None and winner.coles_price is None:
+                            winner.coles_price = loser.coles_price
+                            winner.coles_was_price = loser.coles_was_price
+                        if loser.woolies_price is not None and winner.woolies_price is None:
+                            winner.woolies_price = loser.woolies_price
+                            winner.woolies_was_price = loser.woolies_was_price
+                        if loser.aldi_price is not None and winner.aldi_price is None:
+                            winner.aldi_price = loser.aldi_price
+                            winner.aldi_was_price = loser.aldi_was_price
+                        if loser.image_url and not winner.image_url:
+                            winner.image_url = loser.image_url
+                        if winner.category in ("Weekly Specials", None) and loser.category not in ("Weekly Specials", None):
+                            winner.category = loser.category
+
+                        db_winner = session.get(ProductRecord, winner.name)
+                        db_loser  = session.get(ProductRecord, loser.name)
+                        if db_winner and db_loser:
+                            db_winner.coles_price     = winner.coles_price
+                            db_winner.coles_was_price = winner.coles_was_price
+                            db_winner.woolies_price     = winner.woolies_price
+                            db_winner.woolies_was_price = winner.woolies_was_price
+                            db_winner.aldi_price     = winner.aldi_price
+                            db_winner.aldi_was_price = winner.aldi_was_price
+                            db_winner.image_url = winner.image_url
+                            db_winner.category  = winner.category
+                            session.delete(db_loser)
+                            consumed.add(loser.name)
+                            merged_count += 1
 
             session.commit()
 

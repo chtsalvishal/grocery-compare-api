@@ -100,20 +100,24 @@ def run_sync() -> SyncResult:
         statuses.append(SyncStatus(store=store, status="ok", productsFound=len(records)))
         total += len(records)
 
-    # ── Phase 3: cross-store merge ───────────────────────────────────────────
-    try:
-        merged = merge_products()
-        log.info(f"merge_products: {merged} cross-store merges performed")
-    except Exception as e:
-        log.warning(f"merge_products failed (non-fatal): {e}")
-
+    # ── Phase 3: publish result immediately so /api/sync/status works now ────
     result = SyncResult(
         total=total,
         stores=statuses,
         lastSyncedAt=datetime.datetime.utcnow().isoformat(),
     )
     _last_sync = result
-    log.info(f"Sync complete. Total products: {total}")
+    log.info(f"Sync complete (pre-merge). Total products: {total}")
+
+    # ── Phase 4: cross-store merge runs in background — doesn't block callers ─
+    def _run_merge():
+        try:
+            merged = merge_products()
+            log.info(f"merge_products: {merged} cross-store merges performed")
+        except Exception as e:
+            log.warning(f"merge_products failed (non-fatal): {e}")
+
+    threading.Thread(target=_run_merge, daemon=True).start()
     return result
 
 
