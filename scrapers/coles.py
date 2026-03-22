@@ -25,6 +25,8 @@ _ALLOWED_IMAGE_HOSTS = {
     # Woolworths
     "cdn0.woolworths.com.au",
     "cdn1.woolworths.com.au",
+    "cdn0.woolworths.media",
+    "cdn1.woolworths.media",
     "media.woolworths.com.au",
     "assets.woolworths.com.au",
     "www.woolworths.com.au",

@@ -27,6 +27,8 @@ _ALLOWED_IMAGE_HOSTS = {
     # Woolworths
     "cdn0.woolworths.com.au",
     "cdn1.woolworths.com.au",
+    "cdn0.woolworths.media",
+    "cdn1.woolworths.media",
     "media.woolworths.com.au",
     "assets.woolworths.com.au",
     "www.woolworths.com.au",
@@ -202,6 +204,8 @@ def _to_record(item: dict, now: str) -> Optional[ProductRecord]:
         return None
     was  = item.get("WasPrice")
     img  = item.get("MediumImageFile") or item.get("LargeImageFile") or ""
+    if not img and item.get("Stockcode"):
+        img = f"https://cdn0.woolworths.media/content/wowproductimages/medium/{item.get('Stockcode')}.jpg"
     unit = item.get("PackageSize") or item.get("CupMeasure") or "ea"
     return ProductRecord(
         name=name,
