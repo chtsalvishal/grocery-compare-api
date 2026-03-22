@@ -126,6 +126,20 @@ SEARCH_TERMS = [
 
 def _categorise(name: str) -> str:
     n = name.lower()
+    # Household first — grabs fabric conditioner/softener before Personal Care grabs 'conditioner'
+    if any(w in n for w in ["cleaning", "detergent", "paper towel", "tissue", "bin liner",
+                             "nappy", "dishwash", "bleach", "spray cleaner", "wipe",
+                             "laundry", "fabric softener", "fabric conditioner", "disinfectant"]):
+        return "Household"
+    # Personal Care before Dairy — skin/hair cream must not hit 'cream' in Dairy
+    if any(w in n for w in ["shampoo", "toothpaste", "deodorant", "soap", "body wash",
+                             "moisturiser", "moisturizer", "sunscreen", "perfume", "makeup",
+                             "razor", "face wash", "conditioner", "vitamins", "supplements",
+                             "fish oil", "probiotic", "tampon", "pads", "lip balm",
+                             "lotion", "serum", "hand cream", "face cream", "body cream",
+                             "eye cream", "anti age", "anti-age", "skincare", "skin care",
+                             "protein bar", "protein shake", "protein powder"]):
+        return "Personal Care"
     if any(w in n for w in ["milk", "cheese", "yogurt", "yoghurt", "butter", "cream", "egg", "feta", "custard"]):
         return "Dairy"
     if any(w in n for w in ["chicken", "beef", "pork", "lamb", "mince", "steak", "sausage", "bacon", "meat", "prawn", "salmon", "fish", "turkey", "tuna", "seafood", "salami", "deli", "kransky"]):
@@ -134,18 +148,15 @@ def _categorise(name: str) -> str:
         return "Produce"
     if any(w in n for w in ["bread", "roll", "cake", "cookie", "pastry", "donut", "muffin", "croissant", "crumpet", "wrap", "bagel"]):
         return "Bakery"
-    if any(w in n for w in ["pasta", "rice", "flour", "sugar", "oil", "sauce", "cereal", "canned", "tinned", "soup", "noodle", "oat", "muesli", "beans", "lentil", "chickpea", "stock", "mayo", "honey", "jam", "vegemite"]):
-        return "Pantry"
+    # Beverages before Pantry — 'water', 'juice', 'tea' must not hit 'sugar'/'oil' in Pantry
+    if any(w in n for w in ["water", "juice", "drink", "soda", "beer", "wine", "cider", "coffee", "tea", "cordial", "energy drink", "cola", "sparkling", "premix", "kombucha", "spirits"]):
+        return "Beverages"
     if any(w in n for w in ["frozen", "ice cream", "pizza", "gelato"]):
         return "Frozen"
-    if any(w in n for w in ["water", "juice", "drink", "soda", "beer", "wine", "cider", "coffee", "tea", "cordial", "energy", "cola", "sparkling", "premix", "kombucha", "spirits"]):
-        return "Beverages"
+    if any(w in n for w in ["pasta", "rice", "flour", "sugar", "oil", "sauce", "cereal", "canned", "tinned", "soup", "noodle", "oat", "muesli", "beans", "lentil", "chickpea", "stock", "mayo", "honey", "jam", "vegemite"]):
+        return "Pantry"
     if any(w in n for w in ["chip", "chocolate", "biscuit", "snack", "lolly", "lollies", "candy", "popcorn", "cracker", "pretzel", "tim tam", "muesli bar", "shapes", "licorice", "caramel", "gummy", "nuts", "trail mix"]):
         return "Snacks"
-    if any(w in n for w in ["shampoo", "toothpaste", "deodorant", "soap", "body wash", "moisturiser", "sunscreen", "perfume", "makeup", "razor", "face wash", "conditioner", "vitamin", "protein", "tampon", "pad", "lip balm"]):
-        return "Personal Care"
-    if any(w in n for w in ["cleaning", "detergent", "paper", "tissue", "bin", "nappy", "dishwash", "bleach", "spray", "wipe", "laundry", "fabric softener", "disinfectant"]):
-        return "Household"
     if any(w in n for w in ["dog", "cat", "pet", "puppy", "kitten"]):
         return "Pet"
     if any(w in n for w in ["baby", "infant", "formula", "toddler"]):

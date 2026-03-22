@@ -103,6 +103,20 @@ def _get_build_id() -> Optional[str]:
 
 def _categorise(name: str, merchandise_category: str = "") -> str:
     combined = f"{name.lower()} {merchandise_category.lower()}"
+    # Household first — grabs fabric conditioner/softener before Personal Care grabs 'conditioner'
+    if any(w in combined for w in ["cleaning", "detergent", "paper towel", "tissue", "bin liner",
+                                    "nappy", "dishwash", "bleach", "spray cleaner", "wipe",
+                                    "laundry", "fabric softener", "fabric conditioner", "disinfectant"]):
+        return "Household"
+    # Personal Care before Dairy — skin/hair cream must not hit 'cream' in Dairy
+    if any(w in combined for w in ["shampoo", "toothpaste", "deodorant", "soap", "body wash",
+                                    "moisturiser", "moisturizer", "sunscreen", "perfume", "makeup",
+                                    "razor", "face wash", "conditioner", "vitamins", "supplements",
+                                    "fish oil", "probiotic", "tampon", "pads", "lip balm",
+                                    "lotion", "serum", "hand cream", "face cream", "body cream",
+                                    "eye cream", "anti age", "anti-age", "skincare", "skin care",
+                                    "protein bar", "protein shake", "protein powder"]):
+        return "Personal Care"
     if any(w in combined for w in ["milk", "cheese", "yogurt", "butter", "cream", "egg"]):
         return "Dairy"
     if any(w in combined for w in ["chicken", "beef", "pork", "lamb", "mince", "steak", "sausage", "bacon", "meat"]):
@@ -111,18 +125,15 @@ def _categorise(name: str, merchandise_category: str = "") -> str:
         return "Produce"
     if any(w in combined for w in ["bread", "roll", "cake", "cookie", "pastry", "donut", "muffin"]):
         return "Bakery"
-    if any(w in combined for w in ["pasta", "rice", "flour", "sugar", "oil", "sauce", "cereal", "canned", "tinned"]):
-        return "Pantry"
-    if any(w in combined for w in ["frozen", "ice cream", "pizza"]):
-        return "Frozen"
+    # Beverages before Pantry — 'water', 'juice', 'tea' must not hit 'sugar'/'oil' in Pantry
     if any(w in combined for w in ["water", "juice", "drink", "soda", "coffee", "tea", "beer", "wine"]):
         return "Beverages"
+    if any(w in combined for w in ["frozen", "ice cream", "pizza"]):
+        return "Frozen"
+    if any(w in combined for w in ["pasta", "rice", "flour", "sugar", "oil", "sauce", "cereal", "canned", "tinned"]):
+        return "Pantry"
     if any(w in combined for w in ["chip", "chocolate", "biscuit", "snack", "lolly", "candy"]):
         return "Snacks"
-    if any(w in combined for w in ["shampoo", "toothpaste", "deodorant", "soap", "body wash"]):
-        return "Personal Care"
-    if any(w in combined for w in ["cleaning", "detergent", "paper", "tissue", "bin", "nappy"]):
-        return "Household"
     return "Weekly Specials"
 
 

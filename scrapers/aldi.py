@@ -105,6 +105,20 @@ def _extract_price(text: str) -> Optional[float]:
 
 def _categorise(name: str, default_cat: str) -> str:
     n = name.lower()
+    # Household first — grabs fabric conditioner/softener before Personal Care grabs 'conditioner'
+    if any(w in n for w in ["cleaning", "detergent", "paper towel", "tissue", "bin liner",
+                             "nappy", "dishwash", "bleach", "spray cleaner", "wipe",
+                             "laundry", "fabric softener", "fabric conditioner", "disinfectant"]):
+        return "Household"
+    # Personal Care before Dairy — skin/hair cream must not hit 'cream' in Dairy
+    if any(w in n for w in ["shampoo", "toothpaste", "deodorant", "soap", "body wash",
+                             "moisturiser", "moisturizer", "sunscreen", "perfume", "makeup",
+                             "razor", "face wash", "conditioner", "vitamins", "supplements",
+                             "fish oil", "probiotic", "tampon", "pads", "lip balm",
+                             "lotion", "serum", "hand cream", "face cream", "body cream",
+                             "eye cream", "anti age", "anti-age", "skincare", "skin care",
+                             "protein bar", "protein shake", "protein powder"]):
+        return "Personal Care"
     if any(w in n for w in ["milk", "cheese", "yogurt", "butter", "cream", "egg"]):
         return "Dairy"
     if any(w in n for w in ["chicken", "beef", "pork", "lamb", "mince", "steak", "sausage", "bacon", "prawn", "fish", "salmon"]):
@@ -113,18 +127,15 @@ def _categorise(name: str, default_cat: str) -> str:
         return "Produce"
     if any(w in n for w in ["bread", "roll", "cake", "cookie", "pastry", "donut", "muffin"]):
         return "Bakery"
-    if any(w in n for w in ["pasta", "rice", "flour", "sugar", "oil", "sauce", "cereal", "canned", "tinned", "soup", "noodle"]):
-        return "Pantry"
+    # Beverages before Pantry — 'water', 'juice', 'tea' must not hit 'sugar'/'oil' in Pantry
+    if any(w in n for w in ["water", "juice", "drink", "soda", "coffee", "tea", "cordial", "energy drink", "beer", "wine"]):
+        return "Beverages"
     if any(w in n for w in ["frozen", "ice cream", "pizza"]):
         return "Frozen"
-    if any(w in n for w in ["water", "juice", "drink", "soda", "coffee", "tea", "cordial", "energy"]):
-        return "Beverages"
+    if any(w in n for w in ["pasta", "rice", "flour", "sugar", "oil", "sauce", "cereal", "canned", "tinned", "soup", "noodle"]):
+        return "Pantry"
     if any(w in n for w in ["chip", "chocolate", "biscuit", "snack", "lolly", "candy", "popcorn", "cracker"]):
         return "Snacks"
-    if any(w in n for w in ["shampoo", "toothpaste", "deodorant", "soap", "body wash", "moisturiser", "sunscreen"]):
-        return "Personal Care"
-    if any(w in n for w in ["cleaning", "detergent", "paper", "tissue", "bin", "nappy", "dishwash", "bleach"]):
-        return "Household"
     return default_cat
 
 
@@ -170,7 +181,9 @@ def _parse_tiles(html: str, now: str, default_cat: str, seen: set[str]) -> list[
         img = tile.find("img")
         img_url = None
         if img:
-            src = img.get("src") or img.get("data-src") or ""
+            # Prefer data-src (lazy-load real URL) over src (often a placeholder)
+            src = (img.get("data-src") or img.get("data-lazy")
+                   or img.get("data-original") or img.get("src") or "")
             img_url = _safe_image_url(src)
 
         products.append(ProductRecord(
