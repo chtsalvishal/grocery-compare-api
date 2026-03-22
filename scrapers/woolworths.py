@@ -24,16 +24,33 @@ from curl_cffi.requests import AsyncSession
 from database import ProductRecord
 
 _ALLOWED_IMAGE_HOSTS = {
+    # Woolworths
     "cdn0.woolworths.com.au",
+    "cdn1.woolworths.com.au",
+    "media.woolworths.com.au",
+    "assets.woolworths.com.au",
     "www.woolworths.com.au",
+    # Coles
     "productimages.coles.com.au",
+    "shop.coles.com.au",
     "www.coles.com.au",
+    # Aldi
     "www.aldi.com.au",
+    "images.aldi.com.au",
+    "cdn.aldi.com.au",
 }
 
 
 def _safe_image_url(url: str) -> str | None:
-    if not url or not url.startswith("https://"):
+    if not url:
+        return None
+    # Normalise protocol-relative URLs (e.g. //cdn0.woolworths.com.au/...)
+    if url.startswith("//"):
+        url = "https:" + url
+    # Normalise root-relative URLs against the Woolworths origin
+    if url.startswith("/") and not url.startswith("//"):
+        url = "https://www.woolworths.com.au" + url
+    if not url.startswith("https://"):
         return None
     host = urlparse(url).hostname or ""
     return url if host in _ALLOWED_IMAGE_HOSTS else None
