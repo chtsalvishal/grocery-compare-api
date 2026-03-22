@@ -16,6 +16,7 @@ Optimisations vs naive batch approach:
 import asyncio
 import datetime
 import logging
+import math
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -152,7 +153,8 @@ def _categorise(name: str) -> str:
     return "Weekly Specials"
 
 
-async def _fetch_page(session: AsyncSession, sem: asyncio.Semaphore, term: str, page: int) -> list[dict]:
+async def _fetch_page(session: AsyncSession, sem: asyncio.Semaphore, term: str, page: int) -> tuple[list[dict], int]:
+    """Returns (items, SearchResultsCount). Count is only populated on page 1."""
     async with sem:
         try:
             r = await session.get(
@@ -168,8 +170,9 @@ async def _fetch_page(session: AsyncSession, sem: asyncio.Semaphore, term: str, 
                 timeout=TIMEOUT,
             )
             if r.status_code != 200:
-                return []
+                return [], 0
             data = r.json()
+            total = int(data.get("SearchResultsCount") or 0)
             outer = data.get("Products") or []
             flat: list[dict] = []
             for item in outer:
@@ -178,10 +181,10 @@ async def _fetch_page(session: AsyncSession, sem: asyncio.Semaphore, term: str, 
                     flat.extend(inner)
                 elif item.get("Stockcode"):
                     flat.append(item)
-            return flat
+            return flat, total
         except Exception as e:
             log.debug(f"Woolworths search '{term}' p{page}: {e}")
-            return []
+            return [], 0
 
 
 def _is_special(item: dict) -> bool:
@@ -231,10 +234,15 @@ async def _scrape_async(now: str) -> tuple[list[ProductRecord], Optional[str]]:
         )
 
         # Process page 1 and collect terms that had specials (worth fetching deeper)
-        productive_terms: list[str] = []
-        for term, items in zip(SEARCH_TERMS, page1_results):
-            if isinstance(items, Exception) or not items:
+        # Also store real page count per term to avoid fetching beyond available data
+        productive_terms: list[tuple[str, int]] = []  # (term, real_last_page)
+        for term, result in zip(SEARCH_TERMS, page1_results):
+            if isinstance(result, Exception):
                 continue
+            items, total = result
+            if not items:
+                continue
+            real_last_page = math.ceil(total / 36) if total else 1
             had_special = False
             for item in items:
                 if not _is_special(item):
@@ -249,23 +257,26 @@ async def _scrape_async(now: str) -> tuple[list[ProductRecord], Optional[str]]:
                 if record:
                     products.append(record)
             if had_special:
-                productive_terms.append(term)
+                productive_terms.append((term, real_last_page))
 
         log.info(f"Woolworths p1: {len(products)} specials, {len(productive_terms)}/{len(SEARCH_TERMS)} terms productive")
 
-        # Phase 2: pages 2-N only for productive terms, all concurrently
+        # Phase 2: pages 2-N only for productive terms, capped at real last page
         deeper_tasks = [
             (term, page)
-            for term in productive_terms
-            for page in range(2, PAGES_PER_TERM + 1)
+            for term, real_last_page in productive_terms
+            for page in range(2, min(PAGES_PER_TERM, real_last_page) + 1)
         ]
         if deeper_tasks:
             deeper_results = await asyncio.gather(
                 *[_fetch_page(session, sem, term, page) for term, page in deeper_tasks],
                 return_exceptions=True,
             )
-            for items in deeper_results:
-                if isinstance(items, Exception) or not items:
+            for result in deeper_results:
+                if isinstance(result, Exception):
+                    continue
+                items, _ = result
+                if not items:
                     continue
                 for item in items:
                     if not _is_special(item):
